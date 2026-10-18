@@ -1,0 +1,43 @@
+{
+  "_schema": "Written by the news analyst. pairs[PAIR] = {rating: bullish|bearish|neutral, confidence: low|medium|high, ts_utc (actual rating time, ISO 8601 UTC), summary, sources[], flagged_news[] (news affecting open trades)}. A rating is valid for news_gate.fresh_hours (4h). If no rating is under news_gate.fail_open_after_hours (~5h) old, the gate fails open.",
+  "last_update_utc": "2026-01-01T12:00:00+00:00",
+  "macro": {
+    "note": "Optional free-text macro context. events[] is used by the macro window when macro_window.enabled is true.",
+    "events": [
+      {
+        "name": "US CPI",
+        "ts_utc": "2026-01-14T13:30:00+00:00"
+      }
+    ]
+  },
+  "pairs": {
+    "BTC-USDT": {
+      "rating": "neutral",
+      "confidence": "medium",
+      "ts_utc": "2026-01-01T11:50:00+00:00",
+      "summary": "No major catalyst. ETF flows flat.",
+      "sources": [
+        "https://example.com/article-1"
+      ],
+      "flagged_news": []
+    },
+    "ETH-USDT": {
+      "rating": "bearish",
+      "confidence": "high",
+      "ts_utc": "2026-01-01T11:52:00+00:00",
+      "summary": "Example: large unlock and exchange inflows.",
+      "sources": [
+        "https://example.com/article-2",
+        "https://example.com/article-3"
+      ],
+      "flagged_news": [
+        {
+          "headline": "Example headline",
+          "url": "https://example.com/article-2",
+          "ts_utc": "2026-01-01T10:30:00+00:00",
+          "affects": "open long"
+        }
+      ]
+    }
+  }
+}

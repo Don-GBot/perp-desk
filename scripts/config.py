@@ -1,0 +1,221 @@
+"""Config loader shared by all scripts.
+
+Order of precedence (highest first):
+  1. Environment variables: DATA_DIR, BOT_CONFIG (path to the YAML file).
+  2. config.yaml (path from BOT_CONFIG, else ./config.yaml, else config.yaml in the repo root).
+  3. DEFAULTS below (same values as config.example.yaml).
+
+PyYAML is used if installed. Without it, a small built-in parser reads the subset used by
+config.example.yaml: nested mappings, scalars, inline [a, b] lists, block lists of scalars
+("- item"), and # comments. Anything else raises ConfigError instead of being ignored.
+
+The merged config is validated on load. A bad value raises ConfigError with a clear message.
+"""
+import os, copy
+
+class ConfigError(ValueError):
+    pass
+
+DEFAULTS = {
+    "data_dir": "./data",
+    "risk": {"risk_per_trade_pct": 5, "hard_cut_pct": 5.5, "max_open": 4, "max_per_direction": 4,
+             "one_new_open_per_run": True},
+    "fees": {"taker_rate": 0.0006},
+    "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True},
+    "entry": {"min_rr": 3, "min_stop_atr": 1, "atr_tolerance": 0.95,
+              "trend_filter": {"enabled": True, "timeframe": "4H", "ema_fast": 20, "ema_slow": 50},
+              "max_scan_age_min": 35},
+    "scan": {"universe_size": 25, "max_spread_pct": 0.1, "swing_lookback_1h": 12, "swing_buffer_atr": 0.25,
+             "target_lookback_4h": 60, "atr_period": 14, "candles_limit": 200},
+    "leverage": {"min": 3, "max": 20, "margin_cap_pct": 25, "free_margin_buffer": 0.95,
+                 "margin_mode": "isolated", "mmr_default": 0.005, "max_stop_to_liq": 0.5},
+    "management": {"trail_activate_r": 1.0, "trail_callback_atr": 1.5, "breakeven_at_r": 0.75,
+                   "breakeven_buffer_pct": 0.05, "breakeven_trail_atr": 1.0},
+    "news_gate": {"enabled": True, "fresh_hours": 4, "block_confidence": ["medium", "high"],
+                  "fail_open_after_hours": 5},
+    "macro_window": {"enabled": False, "hours_before": 2, "hours_after": 1},
+    "scanner": {"move_alert_pct": 5, "realert_min_pts": 3, "realert_frac": 0.25, "memory_hours": 24,
+                "coil_ratio": 0.5, "coil_top": 3, "flag_min_quote_vol_usd": 1000000, "flag_bar": "15m"},
+    "shadow_swap": {"hurdle_mult": 1.2, "rr_edge": 0.5, "max_age_min": 60, "slots": [9, 24, 39, 54]},
+}
+
+# ---- minimal YAML subset parser -----------------------------------------------------------------
+def _scalar(s):
+    s = s.strip()
+    if not s: return None
+    if s[0] in "\"'":
+        if len(s) < 2 or s[-1] != s[0]: raise ConfigError(f"unterminated quoted string: {s!r}")
+        return s[1:-1]
+    if s.startswith("["):
+        if not s.endswith("]"): raise ConfigError(f"unterminated inline list: {s!r}")
+        return [_scalar(x) for x in s[1:-1].split(",") if x.strip()]
+    if s.startswith("{"): raise ConfigError(f"inline mappings are not supported by the built-in parser: {s!r} (install PyYAML)")
+    low = s.lower()
+    if low in ("true", "yes", "on"): return True
+    if low in ("false", "no", "off"): return False
+    if low in ("null", "none", "~"): return None
+    try: return int(s)
+    except ValueError: pass
+    try: return float(s)
+    except ValueError: return s
+
+def _strip_comment(line):
+    out, q = [], None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q: q = None
+        elif ch in "\"'": q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"): break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+def _mini_yaml(text):
+    root = {}
+    stack = [(-1, root)]          # (indent, container)
+    pending = None                # (indent, parent_dict, key) for a "key:" with no value yet
+    for n, raw in enumerate(text.splitlines(), 1):
+        if "\t" in raw[:len(raw) - len(raw.lstrip())]: raise ConfigError(f"line {n}: tabs are not allowed for indentation")
+        line = _strip_comment(raw)
+        if not line.strip(): continue
+        ind = len(line) - len(line.lstrip()); body = line.strip()
+        if body.startswith("- ") or body == "-":
+            item = body[1:].strip()
+            if pending and ind > pending[0]:
+                pind, pdict, pkey = pending; pdict[pkey] = []; stack.append((pind, pdict[pkey])); pending = None
+            while stack and stack[-1][0] >= ind and not isinstance(stack[-1][1], list): stack.pop()
+            cont = stack[-1][1]
+            if not isinstance(cont, list): raise ConfigError(f"line {n}: list item without a parent key: {raw!r}")
+            if ":" in item and not item.startswith(("'", '"')): raise ConfigError(f"line {n}: lists of mappings are not supported by the built-in parser (install PyYAML)")
+            cont.append(_scalar(item)); continue
+        if ":" not in body: raise ConfigError(f"line {n}: cannot parse {raw!r}")
+        key, _, val = body.partition(":")
+        key = key.strip()
+        if not key or " " in key and not key.startswith(("'", '"')): raise ConfigError(f"line {n}: bad key {key!r}")
+        if pending:  # previous "key:" had no children -> empty mapping
+            pind, pdict, pkey = pending
+            if ind > pind: pdict[pkey] = {}; stack.append((pind, pdict[pkey]))
+            else: pdict[pkey] = None
+            pending = None
+        while stack and (stack[-1][0] >= ind or isinstance(stack[-1][1], list)): stack.pop()
+        if not stack: raise ConfigError(f"line {n}: bad indentation")
+        parent = stack[-1][1]
+        if not isinstance(parent, dict): raise ConfigError(f"line {n}: mapping inside a list is not supported")
+        if val.strip() == "": pending = (ind, parent, key)
+        else: parent[key] = _scalar(val)
+    if pending: pending[1][pending[2]] = None
+    return root
+
+def _has_content(text):
+    return any(_strip_comment(l).strip() for l in text.splitlines())
+
+# ---- merge + validate ---------------------------------------------------------------------------
+def _merge(base, over):
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict): _merge(base[k], v)
+        else: base[k] = v
+    return base
+
+def _num(cfg, path, lo=None, hi=None, lo_incl=True, hi_incl=True, integer=False):
+    cur = cfg
+    for p in path.split("."): cur = cur[p]
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        raise ConfigError(f"{path} must be a number, got {cur!r}")
+    if integer and int(cur) != cur: raise ConfigError(f"{path} must be a whole number, got {cur!r}")
+    if lo is not None and (cur < lo or (cur == lo and not lo_incl)):
+        raise ConfigError(f"{path} must be {'>=' if lo_incl else '>'} {lo}, got {cur}")
+    if hi is not None and (cur > hi or (cur == hi and not hi_incl)):
+        raise ConfigError(f"{path} must be {'<=' if hi_incl else '<'} {hi}, got {cur}")
+    return cur
+
+def _bool(cfg, path):
+    cur = cfg
+    for p in path.split("."): cur = cur[p]
+    if not isinstance(cur, bool): raise ConfigError(f"{path} must be true or false, got {cur!r}")
+
+def validate(cfg):
+    for sec, d in DEFAULTS.items():
+        if isinstance(d, dict) and not isinstance(cfg.get(sec), dict):
+            raise ConfigError(f"section {sec!r} must be a mapping, got {cfg.get(sec)!r}")
+    r = _num(cfg, "risk.risk_per_trade_pct", 0, 10, lo_incl=False)
+    h = _num(cfg, "risk.hard_cut_pct", 0, 100, lo_incl=False)
+    if h < r: raise ConfigError(f"risk.hard_cut_pct ({h}) must be >= risk.risk_per_trade_pct ({r})")
+    _num(cfg, "risk.max_open", 1, integer=True); _num(cfg, "risk.max_per_direction", 1, integer=True)
+    _bool(cfg, "risk.one_new_open_per_run")
+    _num(cfg, "fees.taker_rate", 0, 0.01)
+    p = cfg["bot"]["client_order_prefix"]
+    if not isinstance(p, str) or not p.isalnum() or not 1 <= len(p) <= 8:
+        raise ConfigError(f"bot.client_order_prefix must be 1-8 letters/digits, got {p!r}")
+    _bool(cfg, "bot.protect_manual_trades")
+    _num(cfg, "entry.min_rr", 0, lo_incl=False); _num(cfg, "entry.min_stop_atr", 0)
+    _num(cfg, "entry.atr_tolerance", 0, 1, lo_incl=False); _num(cfg, "entry.max_scan_age_min", 0, lo_incl=False)
+    tf = cfg["entry"]["trend_filter"]
+    _bool(cfg, "entry.trend_filter.enabled")
+    f = _num(cfg, "entry.trend_filter.ema_fast", 1, integer=True); s = _num(cfg, "entry.trend_filter.ema_slow", 1, integer=True)
+    if f >= s: raise ConfigError("entry.trend_filter.ema_fast must be smaller than ema_slow")
+    if tf["timeframe"] not in ("1H", "2H", "4H", "6H", "8H", "12H", "1D"): raise ConfigError(f"entry.trend_filter.timeframe not supported: {tf['timeframe']!r}")
+    _num(cfg, "scan.universe_size", 1, integer=True); _num(cfg, "scan.max_spread_pct", 0, lo_incl=False)
+    _num(cfg, "scan.swing_lookback_1h", 1, integer=True); _num(cfg, "scan.swing_buffer_atr", 0)
+    _num(cfg, "scan.target_lookback_4h", 1, integer=True); _num(cfg, "scan.atr_period", 1, integer=True)
+    _num(cfg, "scan.candles_limit", 60, 1440, integer=True)
+    lmin = _num(cfg, "leverage.min", 1, integer=True); lmax = _num(cfg, "leverage.max", 1, integer=True)
+    if lmin > lmax: raise ConfigError("leverage.min must be <= leverage.max")
+    _num(cfg, "leverage.margin_cap_pct", 0, 100, lo_incl=False); _num(cfg, "leverage.free_margin_buffer", 0, 1, lo_incl=False)
+    if cfg["leverage"]["margin_mode"] not in ("isolated", "cross"): raise ConfigError("leverage.margin_mode must be isolated or cross")
+    _num(cfg, "leverage.mmr_default", 0, 1); _num(cfg, "leverage.max_stop_to_liq", 0, 1, lo_incl=False)
+    for k in ("trail_activate_r", "trail_callback_atr", "breakeven_at_r", "breakeven_trail_atr"): _num(cfg, "management." + k, 0, lo_incl=False)
+    _num(cfg, "management.breakeven_buffer_pct", 0, 5)
+    _bool(cfg, "news_gate.enabled"); _num(cfg, "news_gate.fresh_hours", 0, lo_incl=False); _num(cfg, "news_gate.fail_open_after_hours", 0, lo_incl=False)
+    bc = cfg["news_gate"]["block_confidence"]
+    if not isinstance(bc, list) or not bc: raise ConfigError("news_gate.block_confidence must be a non-empty list, e.g. [medium, high]")
+    bad = [x for x in bc if str(x).lower() not in ("low", "medium", "high", "med")]
+    if bad: raise ConfigError(f"news_gate.block_confidence has unknown values {bad}; use low, medium, high")
+    _bool(cfg, "macro_window.enabled"); _num(cfg, "macro_window.hours_before", 0); _num(cfg, "macro_window.hours_after", 0)
+    for k in ("move_alert_pct", "realert_min_pts", "memory_hours", "coil_ratio"): _num(cfg, "scanner." + k, 0, lo_incl=False)
+    _num(cfg, "scanner.realert_frac", 0); _num(cfg, "scanner.coil_top", 0, integer=True); _num(cfg, "scanner.flag_min_quote_vol_usd", 0)
+    if not str(cfg["scanner"]["flag_bar"]).endswith(("m", "H")): raise ConfigError("scanner.flag_bar must look like 15m or 1H")
+    _num(cfg, "shadow_swap.hurdle_mult", 0, lo_incl=False); _num(cfg, "shadow_swap.rr_edge", 0); _num(cfg, "shadow_swap.max_age_min", 0, lo_incl=False)
+    sl = cfg["shadow_swap"]["slots"]
+    if not isinstance(sl, list) or not sl or any(isinstance(x, bool) or not isinstance(x, int) or not 0 <= x <= 59 for x in sl):
+        raise ConfigError("shadow_swap.slots must be a non-empty list of minutes 0-59")
+    return cfg
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _find_config():
+    """BOT_CONFIG, else <repo root>/config.yaml, else built-in defaults."""
+    p = os.environ.get("BOT_CONFIG")
+    if p:
+        if not os.path.exists(p): raise ConfigError(f"BOT_CONFIG points to a missing file: {p}")
+        return p
+    c = os.path.join(REPO_ROOT, "config.yaml")   # the working directory is never searched
+    return c if os.path.exists(c) else None
+
+def parse_text(text):
+    """Parse config text with PyYAML if available, else the built-in parser. Never silently returns {}."""
+    try:
+        import yaml  # optional
+        data = yaml.safe_load(text)
+    except ImportError:
+        data = _mini_yaml(text)
+    if data is None: data = {}
+    if not isinstance(data, dict): raise ConfigError("config file must be a mapping at the top level")
+    if not data and _has_content(text): raise ConfigError("config file has content but nothing could be parsed")
+    return data
+
+def load(path=None):
+    cfg = copy.deepcopy(DEFAULTS)
+    p = path or _find_config()
+    if p:
+        with open(p) as fh: _merge(cfg, parse_text(fh.read()))
+    validate(cfg)
+    dd = os.path.expanduser(os.environ.get("DATA_DIR") or cfg["data_dir"])
+    cfg["data_dir"] = os.path.abspath(dd if os.path.isabs(dd) else os.path.join(REPO_ROOT, dd))   # relative = repo root
+    os.makedirs(cfg["data_dir"], exist_ok=True)
+    cfg["_config_path"] = p
+    return cfg
+
+CFG = load()
+DATA_DIR = CFG["data_dir"]
+
+def data_path(*parts):
+    return os.path.join(DATA_DIR, *parts)

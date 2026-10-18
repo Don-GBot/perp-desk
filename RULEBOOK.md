@@ -1,0 +1,174 @@
+# Rulebook
+
+The single list of rules for perp-desk. Values live in `config.yaml`; this file explains them. The bots read this file. They do not change it.
+
+**Who can change rules:** only the human owner, or the Manager acting on the owner's explicit approval. A bot that wants a rule changed asks. Bots never change each other's rules, code, schedules or state.
+
+---
+
+## Team-wide
+
+| # | Rule |
+|---|---|
+| T1 | Blofin USDT-margined perpetual futures only. Funds in other accounts are ignored. |
+| T2 | API keys come only from environment variables (`BLOFIN_API_KEY`, `BLOFIN_API_SECRET`, `BLOFIN_PASSPHRASE`). Trade permission only, withdrawals disabled. Never use keys pasted in chat. |
+| T3 | Bots never transfer or convert funds. |
+| T4 | Only the Executor places orders. `scan.py` / `scan.json` is the only setup source. |
+| T5 | Pipeline: the alerts scanner writes `flags_latest.json`; the news analyst writes `fundamentals.json`; the Executor reads both plus `scan.json` and applies its own risk rules. Agents do not message each other. Shared files are the interface. |
+| T6 | Scanner flags are info only. They are recorded, never used to enter, size, skip or exit. |
+| T7 | Swaps are shadow only. `shadow_swap.py` makes GET calls only. No bot closes a trade to swap into another until the owner approves it. |
+| T8 | Schedules: see `docs/scheduling.md`. Small start-time drift is acceptable. |
+| T9 | Quiet by default. The Executor reports opens, closes, adjustments and errors. The others report only new, urgent items or failures. |
+| T10 | Orders are real. Only the Executor's environment holds trading keys. All order actions go through `execute.py` and `manage.py`, which hold a shared lock so two actions never overlap. |
+
+---
+
+## 1. Alerts scanner (optional; `scripts/scanner.py`)
+
+Never trades. Never produces setups. Sends nothing to the Executor.
+
+| Rule | Value |
+|---|---|
+| Universe | Identical to the Executor's: top `universe_size` USDT perps by 24h quote volume, then drop spread > `max_spread_pct`. |
+| Big move | abs(change from 24h open) ≥ `move_alert_pct` (5%). |
+| Re-alert | Only on a direction flip, or a further same-direction move ≥ max(`realert_min_pts`, `realert_frac` × last reported move). Memory `memory_hours` (24h). |
+| New in universe | Pair not seen in the universe in the last 24h. |
+| Coils | 12×1H range / median prior range < `coil_ratio` (0.5). Report the `coil_top` (3) tightest, new once per 24h. Coils only ride along with another alert. |
+| Flags | Last 2 **closed** 15m candles. unusual_volume (≥ 2× avg of prior 20), volume_spike (≥ 3×), breakout/breakdown, strong_move, behind a strong-close and no-chase gate. Deduped on (pair, type, candle_close_time). Info only. |
+
+---
+
+## 2. Executor
+
+### Run order
+1. Run the alerts scanner (step 0) and read its summary.
+2. Manage open positions.
+3. Refresh the scan if older than `max_scan_age_min` (30) and a slot is free.
+4. Filter setups.
+5. Open at most one trade.
+6. Log the run.
+
+### Entry filters
+| Rule | Value |
+|---|---|
+| Minimum R:R | ≥ `min_rr` (3) at the live price (ask for long, bid for short), net of round-trip taker fees (`fees.taker_rate`), stop and target rounded to tick. |
+| Side geometry | After rounding: stop < entry < target for longs, target < entry < stop for shorts. |
+| Fresh scan | `scan.json` no older than `max_scan_age_min` (35). |
+| Stop vs ATR | Stop distance ≥ `min_stop_atr` (1) × ATR14 on 1H. The order script allows `atr_tolerance` (0.95) for drift. |
+| Trend | With the 4H trend: EMA20 > EMA50 and close > EMA50 for longs, mirror for shorts. Flat pairs are skipped. Re-checked at order time. |
+| Equity | Skip if equity can't be read. |
+| Caps | `max_open` (4) overall, `max_per_direction` (4) per side, checked right before the order. Manual positions count. |
+| No duplicates | No new trade on a pair with any position. |
+| One per run | At most one new open per run. If the best setup fails a check, the next one is tried. |
+| Position mode | Account must be in net (one-way) mode. |
+| News gate | See below. |
+| Macro window | Off by default (`macro_window.enabled: false`) because nothing feeds it yet. When on: no new entries from `hours_before` (2h) before to `hours_after` (1h) after a dated macro event. |
+
+### Setup definition (`scan.py`)
+- Long: entry = ask. Stop = the lower of (lowest low of the last 12 1H candles − 0.25 ATR) and (entry − 1 ATR). Target = highest high of the last 60 4H candles.
+- Short: the mirror.
+- Keep setups with R:R ≥ 3, best R:R first.
+
+### Sizing, leverage, margin
+| Rule | Value |
+|---|---|
+| Risk per trade | `risk_per_trade_pct` of live equity lost at the technical stop, including entry and exit taker fees. Default 5%. Up to `max_open` × that at once (4 × 5% = 20%). |
+| Size | floor(equity × risk / (contract value × (stop distance + fee × (entry + stop))), lot size). Skip if below the instrument minimum. |
+| Margin mode | `margin_mode` (isolated) for new bot trades. |
+| Leverage | Lowest integer L in [`min`, `max`] (3–20), also ≤ the instrument max, with margin = notional / L ≤ min(`margin_cap_pct` (25%) of equity, 95% of free margin). Skip if none fits. |
+| Liquidation buffer | Skip if stop distance ≥ `max_stop_to_liq` (0.5) × estimated liquidation distance, i.e. liquidation must be more than 2× further than the stop. |
+| Existing pairs | Never change leverage on a pair with any existing position. |
+
+Note: with a small account, low-volatility pairs (1H ATR under ~1%) often fail the leverage fit and never trade. That is expected.
+
+### Orders
+| Rule | Value |
+|---|---|
+| Entry | Market order with attached TP (target) and SL (technical stop), both market on trigger. |
+| Trailing stop | Right after the fill: full size, reduce-only, activates at +`trail_activate_r` (1R) from the average fill, callback `trail_callback_atr` (1.5) × 1H ATR. |
+| Verify | Confirm TP/SL and the trailing stop are live, and liquidation is well beyond the stop. |
+| One trail | Cancel the old trailing stop before placing a new one. |
+
+### Managing open trades
+| Rule | Value |
+|---|---|
+| Missing stop | Add one. |
+| Break-even | When price reaches +`breakeven_at_r` (0.75) × initial stop distance: stop to entry ± `breakeven_buffer_pct` (0.05%), keep the target, replace the trail with `breakeven_trail_atr` (1) × ATR. Once per position. |
+| Hard cut | Each bot position may lose at most `hard_cut_pct` (5.5%) of equity at entry at its stop, entry and exit fees included. Equity at entry comes from `bot_positions.json`; if unknown, the wallet balance without unrealized PnL. Tighten looser or missing stops, never widen. Close at market a position already down that much, or one with no stop whose mark is already past where the stop would go (`manage.py hard-cut`, `manage.py ensure-stops`). |
+| Margin mode | Always use the position's own margin mode. Never switch it. |
+| Never resize | Do not resize open trades. |
+| Flagged news | Medium or high confidence may tighten a stop, never widen it. Low confidence is logged only. |
+
+### Manual trades (opened by the owner)
+Controlled by `bot.protect_manual_trades` (default `true`). A position is the bot's if a `bot_positions.json` record matches it, or the exchange order history shows a filled, non-reduce-only opening order with the bot's client order id prefix (`bot.client_order_prefix`) created within 120 s of the position. A record matches only if pair and side agree and the position was created within 120 s of the record's `opened_at` (or has the recorded position create time). Pair and side alone never count, so an old record cannot claim a later manual trade. Records that match no open position are pruned at the start of every `execute.py` and `manage.py` run.
+- `true`: the hard cut, break-even and scripted closes apply only to bot positions. A manual position without a stop gets an alert to the owner; the bot places nothing on it. The bot never closes, trims, adds to or re-levers a manual position.
+- `false`: manual positions are managed exactly like bot positions.
+Either way, manual positions block bot entries on that pair and count toward the caps.
+
+### News gate (`scripts/news_gate.py`)
+| Rule | Value |
+|---|---|
+| Source | `fundamentals.json`, written by the news analyst. |
+| Freshness | A rating is valid for `fresh_hours` (4h) from its `ts_utc`, the real rating time. |
+| Block | Only a fresh opposing rating with medium or high confidence blocks: bearish blocks a long, bullish blocks a short. |
+| Low confidence | Logged only. |
+| Neutral | Never blocks. |
+| Fail open | If no rating is younger than `fail_open_after_hours` (~5h), or the file is missing, the gate allows entries. |
+| Enforced by | `execute.py`, on every candidate, together with the macro window when enabled. |
+
+### Logging
+Every run, open position and closed trade goes in `state.json`. Each new entry records its news rating and `scanner_flag` (that pair's flags within the last 2 closed 15m candles, or `[]`).
+
+---
+
+## 3. Shadow swap logger (`scripts/shadow_swap.py`)
+
+Read only. No LLM. Runs from plain cron.
+
+| Rule | Value |
+|---|---|
+| Candidates | `scan.json` setups that pass the same entry filters as the Executor and are ≤ `max_age_min` (60) old. |
+| Standard rule | PASS iff candidate EV ≥ (old remaining profit + close fee) × `hurdle_mult` (1.2) AND candidate R:R ≥ old R:R + `rr_edge` (0.5). |
+| Break-even rule | Old stop at or past entry: PASS iff candidate EV ≥ old remaining profit × 1.2. R:R rule skipped. |
+| Margin | The candidate must fit the margin rules after freeing the old trade's margin. |
+| Output | One JSON record per decision plus a SUMMARY per cycle. |
+| Go-live | Only after the Manager's weekly go/no-go and the owner's approval. |
+
+---
+
+## 4. News analyst
+| Rule | Value |
+|---|---|
+| Role | Rate each pair bullish / bearish / neutral with confidence low / medium / high, sources and the real rating time. |
+| Coverage | The Executor's universe plus any pair with an open position. |
+| Cadence | Every 4h. |
+| Output | `fundamentals.json`, written atomically. Never messages other agents. |
+| Never trades | Advisory only. |
+
+---
+
+## 5. Manager
+Audits the bots against logs and this rulebook. See `prompts/manager.md`.
+
+## Operating principles
+1. One front door: the owner talks to the Manager, which relays approved changes.
+2. No bot grades its own work.
+3. No "done" without proof: a change counts only when you can show what changed and where.
+4. Humans own the irreversible: rule changes, code changes and anything with real money need the owner's go.
+
+## Usage rules
+- Silence rule for all bots: no message when nothing happened.
+- Same error twice in a row: report once, stop retrying.
+- Lean runs: no full JSON or log dumps in chat.
+- Long chats get reset with a handoff summary.
+
+## Known gaps (decide these for your own setup)
+- **Macro events need a source.** The window ships disabled because no calendar ships with this repo. The news analyst can add events to `fundamentals.json` under `macro.events`, or you can wire a calendar.
+- **Break-even uses the current mark price**, not the best price since entry. A move that reaches the trigger and reverses between runs is missed.
+- **Rating validity equals the news cadence (4h).** A late news run leaves a gap where ratings are not fresh but the gate has not failed open yet. Entries are allowed in that gap.
+- **No re-entry cooldown** after a stop-out.
+- **Slippage and funding are not in R:R or the risk cap** (taker fees are). A stop-out can still lose more than planned.
+- **Per-direction cap equals the overall cap** by default, so it does nothing until you lower it.
+- **Setup choice:** `execute.py` takes the first (best R:R) setup unless the agent passes `--inst`.
+- **Ownership needs timestamps.** A position the bot opened is recognized by create time (within 120 s of the record or of a bot-prefixed opening order). If the exchange reports a create time far from the order time, the bot treats the position as manual.
+- **Scan freshness (35 min) and shadow candidate age (60 min) differ.**

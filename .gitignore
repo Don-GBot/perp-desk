@@ -1,0 +1,14 @@
+# runtime data and logs
+data/
+*.jsonl
+*.log
+state*.json
+*.lock
+# secrets and local config
+.env
+.env.*
+!.env.example
+config.yaml
+# python
+__pycache__/
+*.pyc

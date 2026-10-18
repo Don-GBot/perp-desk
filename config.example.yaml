@@ -1,0 +1,171 @@
+# config.example.yaml
+# Copy to config.yaml in the repo root and edit. config.yaml is git-ignored.
+# Lookup order: the BOT_CONFIG env var, then <repo root>/config.yaml, then built-in defaults.
+# The current working directory is never searched.
+# Every value here has a default in scripts/config.py, so a missing key falls back to the
+# value shown below. Percentages are written as percent (1 = 1%), not fractions.
+
+# Where scripts read and write their files (scan.json, flags_latest.json, fundamentals.json,
+# logs, state). Relative paths are relative to the repo root.
+# The DATA_DIR environment variable overrides this.
+data_dir: ./data
+
+# ---------------------------------------------------------------------------
+# Risk
+# ---------------------------------------------------------------------------
+risk:
+  # Percent of live equity lost if the technical stop is hit.
+  # Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
+  risk_per_trade_pct: 5
+  # Hard-cut backstop per position: max loss at the stop, entry and exit fees included, as a
+  # percent of equity at entry (wallet balance without unrealized PnL if unknown).
+  # `manage.py hard-cut` tightens missing or looser stops to this level (never widens) and closes
+  # any position already down this much. With protect_manual_trades it only touches bot positions.
+  # Must be >= risk_per_trade_pct. Keep it a bit above to leave room for slippage.
+  hard_cut_pct: 5.5
+  # Max open positions overall, and per direction (long / short).
+  max_open: 4
+  max_per_direction: 4
+  # At most one new position per executor run.
+  one_new_open_per_run: true
+  # Worst case: max_open x risk_per_trade_pct of equity at risk at once (4 x 5% = 20%).
+
+# ---------------------------------------------------------------------------
+# Fees
+# ---------------------------------------------------------------------------
+fees:
+  # Taker fee per side as a fraction (0.0006 = 0.06%). Used in the R:R check and in sizing, so a
+  # clean stop-out loses about risk_per_trade_pct of equity including entry and exit fees.
+  taker_rate: 0.0006
+
+# ---------------------------------------------------------------------------
+# Bot identity and manual trades
+# ---------------------------------------------------------------------------
+bot:
+  # Client order id prefix for orders this bot places (letters/digits, max 8). Used to tell
+  # bot positions from manual ones.
+  client_order_prefix: bfx
+  # true: the hard cut, break-even and scripted closes apply only to positions the bot opened.
+  #       Manual positions only get a missing-stop alert.
+  # false: manual positions are managed like bot positions.
+  protect_manual_trades: true
+
+# ---------------------------------------------------------------------------
+# Entry filters
+# ---------------------------------------------------------------------------
+entry:
+  # Minimum reward:risk at the live price (ask for longs, bid for shorts), net of round-trip fees.
+  min_rr: 3
+  # Stop distance must be at least this many 1H ATR(14).
+  min_stop_atr: 1
+  # Tolerance on the ATR check at order time: allow stop >= min_stop_atr * this factor.
+  # 0.95 lets a stop computed at exactly 1 ATR survive small price drift.
+  atr_tolerance: 0.95
+  # Trend filter: 4H EMA fast/slow. Up = fast > slow and close > slow. Down = mirror.
+  # Flat pairs are skipped. Only trade with the trend.
+  trend_filter:
+    enabled: true
+    timeframe: 4H
+    ema_fast: 20
+    ema_slow: 50
+  # execute.py refuses scan.json older than this many minutes. Refresh the scan first.
+  max_scan_age_min: 35
+
+# ---------------------------------------------------------------------------
+# Setup scanner (scripts/scan.py)
+# ---------------------------------------------------------------------------
+scan:
+  # Universe: live Crypto USDT perps (no stocks/commodities/indices, nothing scheduled for
+  # delisting), top N by 24h quote volume...
+  universe_size: 25
+  # ...then drop pairs whose bid/ask spread is wider than this percent of last price.
+  max_spread_pct: 0.1
+  # Stop = the further of (swing low/high of the last N 1H candles -/+ buffer * ATR)
+  # and (entry -/+ min_stop_atr * ATR).
+  swing_lookback_1h: 12
+  swing_buffer_atr: 0.25
+  # Target = highest high (long) / lowest low (short) of the last N 4H candles.
+  target_lookback_4h: 60
+  atr_period: 14
+  candles_limit: 200
+
+# ---------------------------------------------------------------------------
+# Sizing, leverage, margin (scripts/execute.py)
+# ---------------------------------------------------------------------------
+leverage:
+  # Pick the LOWEST integer leverage in [min, max] (also capped by the instrument max)
+  # such that margin = notional / leverage fits under the margin cap. Skip if none fits.
+  min: 3
+  max: 20
+  # Margin cap per new position, percent of equity. Also capped at free_margin_buffer of free margin.
+  margin_cap_pct: 25
+  free_margin_buffer: 0.95
+  # Margin mode for new bot positions. Existing positions are always managed in their own mode.
+  margin_mode: isolated
+  # Default maintenance margin rate when the instrument does not report one.
+  mmr_default: 0.005
+  # Skip if the stop distance is >= this fraction of the estimated liquidation distance.
+  # 0.5 means the liquidation price must be more than 2x further away than the stop.
+  max_stop_to_liq: 0.5
+
+# ---------------------------------------------------------------------------
+# Trade management (scripts/manage.py; trailing stop placed by execute.py)
+# ---------------------------------------------------------------------------
+management:
+  # Trailing stop placed after the fill: activates at +trail_activate_r R, callback = N x 1H ATR.
+  trail_activate_r: 1.0
+  trail_callback_atr: 1.5
+  # Break-even: once price has moved breakeven_at_r x initial stop distance in favor, move the
+  # stop to entry +/- breakeven_buffer_pct (fee buffer), keep the target, tighten the trail to
+  # breakeven_trail_atr x ATR. Once per position.
+  breakeven_at_r: 0.75
+  breakeven_buffer_pct: 0.05
+  breakeven_trail_atr: 1.0
+
+# ---------------------------------------------------------------------------
+# News gate (reads DATA_DIR/fundamentals.json written by the news analyst)
+# ---------------------------------------------------------------------------
+news_gate:
+  enabled: true
+  # A rating is "fresh" for this many hours after its ts_utc (the real rating time).
+  fresh_hours: 4
+  # Only fresh opposing ratings with one of these confidences block an entry.
+  # Bearish blocks a long, bullish blocks a short. Neutral never blocks. Low is logged only.
+  block_confidence:
+    - medium
+    - high
+  # If no rating in the file is younger than this, or the file is missing, the gate fails open.
+  fail_open_after_hours: 5
+
+# ---------------------------------------------------------------------------
+# Macro / event window
+# ---------------------------------------------------------------------------
+# No new entries from hours_before to hours_after a dated macro event (CPI, FOMC, etc.).
+# Off by default: nothing in this repo feeds it yet. Turn it on only once the news analyst (or
+# another source) writes dated events to fundamentals.json under macro.events.
+macro_window:
+  enabled: false
+  hours_before: 2
+  hours_after: 1
+
+# ---------------------------------------------------------------------------
+# Alerts scanner (scripts/scanner.py; the executor runs it as step 0 by default)
+# ---------------------------------------------------------------------------
+scanner:
+  move_alert_pct: 5          # alert on |change from 24h open| >= this
+  realert_min_pts: 3         # re-alert only after a further move of max(this, realert_frac x last move)
+  realert_frac: 0.25
+  memory_hours: 24
+  coil_ratio: 0.5            # 12x1H range / median prior range below this = coil
+  coil_top: 3
+  flag_min_quote_vol_usd: 1000000
+  flag_bar: 15m
+
+# ---------------------------------------------------------------------------
+# Shadow swap logger (scripts/shadow_swap.py, read-only)
+# ---------------------------------------------------------------------------
+shadow_swap:
+  hurdle_mult: 1.2           # candidate EV must beat (remaining profit + close fee) x this
+  rr_edge: 0.5               # and candidate R:R must beat old R:R + this
+  max_age_min: 60            # ignore scan setups older than this
+  slots: [9, 24, 39, 54]     # minutes past the hour for the built-in scheduler
