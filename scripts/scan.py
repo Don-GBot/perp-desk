@@ -2,7 +2,8 @@
 """Setup scanner. The ONLY source of trade setups. Public endpoints only, no API keys needed.
 
 Rules (all values from config.yaml -> scan / entry / fees):
-  - Universe: USDT perps that are assetClass "Crypto", state "live" and have no scheduled offTime
+  - Universe: USDT perps of any asset class, state "live", no scheduled offTime (stock perps are blocked later by
+    execute.py's stock-perp gate; commodities and forex are allowed)
     (delisting), ranked by 24h quote volume; top `universe_size`, then drop spread > `max_spread_pct`.
   - Only CLOSED candles (confirm == "1") are used for trend, ATR, swing and target.
   - Trend: 4H EMA fast/slow. Up = fast > slow and close > slow. Down = mirror. Flat pairs are skipped.
@@ -56,11 +57,11 @@ def net_rr(side, entry, stop, target, fee=FEE):
     return reward_net / risk_net if risk > 0 and risk_net > 0 else 0.0
 
 def tradable_instruments():
-    """instId -> instrument for live Crypto USDT perps with no scheduled offTime."""
+    """instId -> instrument for live USDT perps (any asset class) with no scheduled offTime."""
     r = bf.public('/api/v1/market/instruments')
     if str(r.get('code')) != '0': raise RuntimeError(f"instruments: code {r.get('code')} {r.get('msg')}")
     return {x['instId']: x for x in r['data']
-            if x.get('assetClass') == 'Crypto' and x.get('state') == 'live' and not x.get('offTime')
+            if x.get('state') == 'live' and not x.get('offTime')
             and x['instId'].endswith('-USDT')}
 
 def universe(top=None, max_spread_pct=None):

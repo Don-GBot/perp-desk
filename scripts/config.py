@@ -18,9 +18,9 @@ class ConfigError(ValueError):
 
 DEFAULTS = {
     "data_dir": "./data",
-    "risk": {"risk_per_trade_pct": 5, "hard_cut_pct": 5.5, "max_open": 4, "max_per_direction": 4,
-             "one_new_open_per_run": True},
-    "fees": {"taker_rate": 0.0006},
+    "risk": {"risk_per_trade_pct": 5, "hard_cut_pct": 5.5, "max_open": 4, "max_per_direction": 3,
+             "one_new_open_per_run": True, "cooldown_hours": 4},
+    "fees": {"taker_rate": 0.0006, "slip_frac": 0.0018},
     "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True},
     "entry": {"min_rr": 3, "min_stop_atr": 1, "atr_tolerance": 0.95,
               "trend_filter": {"enabled": True, "timeframe": "4H", "ema_fast": 20, "ema_slow": 50},
@@ -32,7 +32,7 @@ DEFAULTS = {
     "leverage": {"min": 3, "max": 20, "margin_cap_pct": 25, "free_margin_buffer": 0.95,
                  "margin_mode": "isolated", "mmr_default": 0.005, "max_stop_to_liq": 0.5},
     "management": {"trail_activate_r": 1.0, "trail_callback_atr": 1.5, "breakeven_at_r": 0.75,
-                   "breakeven_buffer_pct": 0.05, "breakeven_trail_atr": 1.0},
+                   "breakeven_fee_legs": 2, "breakeven_trail_atr": 1.0},
     "news_gate": {"enabled": True, "fresh_hours": 4, "block_confidence": ["medium", "high"],
                   "fail_open_after_hours": 5},
     "macro_window": {"enabled": False, "hours_before": 2, "hours_after": 1},
@@ -145,8 +145,8 @@ def validate(cfg):
     h = _num(cfg, "risk.hard_cut_pct", 0, 100, lo_incl=False)
     if h < r: raise ConfigError(f"risk.hard_cut_pct ({h}) must be >= risk.risk_per_trade_pct ({r})")
     _num(cfg, "risk.max_open", 1, integer=True); _num(cfg, "risk.max_per_direction", 1, integer=True)
-    _bool(cfg, "risk.one_new_open_per_run")
-    _num(cfg, "fees.taker_rate", 0, 0.01)
+    _bool(cfg, "risk.one_new_open_per_run"); _num(cfg, "risk.cooldown_hours", 0)
+    _num(cfg, "fees.taker_rate", 0, 0.01); _num(cfg, "fees.slip_frac", 0, 0.05)
     p = cfg["bot"]["client_order_prefix"]
     if not isinstance(p, str) or not p.isalnum() or not 1 <= len(p) <= 8:
         raise ConfigError(f"bot.client_order_prefix must be 1-8 letters/digits, got {p!r}")
@@ -178,7 +178,7 @@ def validate(cfg):
     if cfg["leverage"]["margin_mode"] not in ("isolated", "cross"): raise ConfigError("leverage.margin_mode must be isolated or cross")
     _num(cfg, "leverage.mmr_default", 0, 1); _num(cfg, "leverage.max_stop_to_liq", 0, 1, lo_incl=False)
     for k in ("trail_activate_r", "trail_callback_atr", "breakeven_at_r", "breakeven_trail_atr"): _num(cfg, "management." + k, 0, lo_incl=False)
-    _num(cfg, "management.breakeven_buffer_pct", 0, 5)
+    _num(cfg, "management.breakeven_fee_legs", 0, 10)
     _bool(cfg, "news_gate.enabled"); _num(cfg, "news_gate.fresh_hours", 0, lo_incl=False); _num(cfg, "news_gate.fail_open_after_hours", 0, lo_incl=False)
     bc = cfg["news_gate"]["block_confidence"]
     if not isinstance(bc, list) or not bc: raise ConfigError("news_gate.block_confidence must be a non-empty list, e.g. [medium, high]")

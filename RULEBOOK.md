@@ -59,7 +59,8 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | 1H trend gate | `entry.trend_1h` (on): longs only in a 1H uptrend, shorts only in a 1H downtrend (EMA20/EMA50 + close vs EMA50 on 200 closed 1H candles, `scripts/trend1h.py`). Flat blocks both. A data error skips the setup (fails closed). Logged as `1h_trend`. |
 | Stock perps | `entry.stock_perp_block` (on): no new entries on stock perps (equities, ETFs, index perps, tokenized stocks): the maintained list in `scripts/stockperp.py` OR exchange assetClass Stocks/Indices. Checked first; unreadable metadata for an unlisted pair skips (fails closed). Open positions are never touched. Logged as `stock_perp`. |
 | Equity | Skip if equity can't be read. |
-| Caps | `max_open` (4) overall, `max_per_direction` (4) per side, checked right before the order. Manual positions count. |
+| Caps | `max_open` (4) overall, all positions incl. manual. `max_per_direction` (3): open BOT positions per side; manual positions don't count. Entry-only, never closes anything. If the bot positions can't be read, the entry is skipped. |
+| Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (BE already moved, or exit at/beyond the BE stop), manual positions and manual closes don't trigger it. A read error skips the entry. |
 | No duplicates | No new trade on a pair with any position. |
 | One per run | At most one new open per run. If the best setup fails a check, the next one is tried. |
 | Position mode | Account must be in net (one-way) mode. |
@@ -74,8 +75,8 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 ### Sizing, leverage, margin
 | Rule | Value |
 |---|---|
-| Risk per trade | `risk_per_trade_pct` of live equity lost at the technical stop, including entry and exit taker fees. Default 5%. Up to `max_open` × that at once (4 × 5% = 20%). |
-| Size | floor(equity × risk / (contract value × (stop distance + fee × (entry + stop))), lot size). Skip if below the instrument minimum. |
+| Risk per trade | `risk_per_trade_pct` of live equity lost at the technical stop, including entry and exit taker fees and the slippage buffer (`slip_frac` 0.18% of entry). Default 5%. Up to `max_open` × that at once (4 × 5% = 20%). |
+| Size | floor(equity × risk / (contract value × (stop distance + fee × (entry + stop) + slip_frac × entry)), lot size). Skip if below the instrument minimum. |
 | Margin mode | `margin_mode` (isolated) for new bot trades. |
 | Leverage | Lowest integer L in [`min`, `max`] (3–20), also ≤ the instrument max, with margin = notional / L ≤ min(`margin_cap_pct` (25%) of equity, 95% of free margin). Skip if none fits. |
 | Liquidation buffer | Skip if stop distance ≥ `max_stop_to_liq` (0.5) × estimated liquidation distance, i.e. liquidation must be more than 2× further than the stop. |
@@ -95,8 +96,8 @@ Note: with a small account, low-volatility pairs (1H ATR under ~1%) often fail t
 | Rule | Value |
 |---|---|
 | Missing stop | Add one. |
-| Break-even | When price reaches +`breakeven_at_r` (0.75) × initial stop distance: stop to entry ± `breakeven_buffer_pct` (0.05%), keep the target, replace the trail with `breakeven_trail_atr` (1) × ATR. Once per position. |
-| Hard cut | Each bot position may lose at most `hard_cut_pct` (5.5%) of equity at entry at its stop, entry and exit fees included. Equity at entry comes from `bot_positions.json`; if unknown, the wallet balance without unrealized PnL. Tighten looser or missing stops, never widen. Close at market a position already down that much, or one with no stop whose mark is already past where the stop would go (`manage.py hard-cut`, `manage.py ensure-stops`). |
+| Break-even | When price reaches +`breakeven_at_r` (0.75) × initial stop distance: stop to entry ± round-trip taker fees (`breakeven_fee_legs` 2 × 0.06% = 0.12%), rounded to the tick in the trade's favour, so a BE exit nets about 0. A recorded BE stop keeps priority. Keep the target, replace the trail with `breakeven_trail_atr` (1) × ATR. Once per position. |
+| Hard cut | Each bot position may lose at most `hard_cut_pct` (5.5%) of equity at entry at its stop, entry and exit fees and the slippage buffer (`fees.slip_frac` 0.18% of entry) included, the same terms as sizing. Manual positions (only when `protect_manual_trades` is false) use the price-only distance. Known limit: the cut cannot catch slippage inside the exchange's own stop fill. Equity at entry comes from `bot_positions.json`; if unknown, the wallet balance without unrealized PnL. Tighten looser or missing stops, never widen. Close at market a position already down that much, or one with no stop whose mark is already past where the stop would go (`manage.py hard-cut`, `manage.py ensure-stops`). |
 | Margin mode | Always use the position's own margin mode. Never switch it. |
 | Never resize | Do not resize open trades. |
 | Flagged news | Medium or high confidence may tighten a stop, never widen it. Low confidence is logged only. |

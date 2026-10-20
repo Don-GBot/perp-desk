@@ -242,8 +242,92 @@ class TestManageBookkeeping(NoNetwork):
                                                  openAveragePrice="10", closeAveragePrice="11", realizedPnl="1", fee="-0.01")]
             if path == funding.PATH: return []
             raise AssertionError(path)
+        registry.save({"INJ-USDT": rec}); registry.save_pending([])
+        registry.prune_full([])                       # position gone -> queued in closed_pending.json
         with mock.patch.object(manage, "_get", get):
             book = manage.bookkeeping({"INJ-USDT": rec}, {})
+        self.assertEqual(registry.load_pending(), [])
         self.assertEqual(book["closes"][0]["positionId"], "9"); self.assertEqual(book["errors"], [])
         res = dict(ok=True); rid = manage.log_run("status", res, book)
         self.assertTrue(rid); self.assertEqual(runlog._load()[runlog.find(runlog._load(), rid)]["closes"][0]["positionId"], "9")
+
+# ---- live rules ported 2026-10-20: cooldown, direction cap 3, BE at round-trip fees, slippage, commodities ----------
+def write_closed(lines):
+    with open(config.data_path(closes.FILE), "w") as fh:
+        for l in lines: fh.write(json.dumps(l) + "\n")
+
+class TestCooldown(GateBase):
+    def setUp(self):
+        super().setUp(); self.now = dt.datetime.now(dt.timezone.utc); self.nm = int(self.now.timestamp() * 1000)
+    def tearDown(self):
+        write_closed([]); super().tearDown()
+    def L(self, **k):
+        d = dict(instId="BTC-USDT", side="buy", realized_pnl=-10, kind="stop", close_ms=self.nm - 3_600_000, be_done=False)
+        d.update(k); return d
+    def test_values(self):
+        self.assertEqual(config.CFG["risk"]["cooldown_hours"], 4); self.assertEqual(EX.MAXDIR, 3)
+        self.assertEqual(EX.SLIP, 0.0018); self.assertEqual(config.CFG["management"]["breakeven_fee_legs"], 2)
+    def test_losing_stop_blocks_same_side_4h(self):
+        write_closed([self.L()])
+        plan, why = EX.evaluate(SETUP, self.ctx)
+        self.assertIsNone(plan); self.assertTrue(why.startswith("cooldown until"), why)
+        self.assertFalse(closes.cooldown_check("BTC-USDT", "sell", self.now)["block"])                 # opposite side ok
+        write_closed([self.L(close_ms=self.nm - 5 * 3_600_000)])
+        self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"])                  # after 4h
+    def test_kinds_that_do_not_trigger(self):
+        for l in (self.L(realized_pnl=5, kind="tp"), self.L(kind="manual"), self.L(be_done=True),
+                  self.L(close_avg=100.2, be_stop=100.1), self.L(realized_pnl=0)):
+            write_closed([l]); self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], l)
+        for k in ("stop", "trail", "cut"):
+            write_closed([self.L(kind=k)]); self.assertTrue(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], k)
+    def test_unreadable_fails_closed(self):
+        with open(config.data_path(closes.FILE), "w") as fh: fh.write("{broken\n")
+        plan, why = EX.evaluate(SETUP, self.ctx)
+        self.assertIsNone(plan); self.assertTrue(why.startswith("cooldown check error"))
+    def test_close_kind(self):
+        self.assertEqual(closes.close_kind(dict(close_by="cut"), -5), "cut")
+        self.assertEqual(closes.close_kind({}, -5), "stop"); self.assertEqual(closes.close_kind({}, 5), "tp")
+
+class TestDirCap(GateBase):
+    def pos(self, inst, n="1", ct=None):
+        return dict(instId=inst, positions=n, createTime=str(ct or T.now_ms()))
+    def tearDown(self): registry.save({}); super().tearDown()
+    def test_three_bot_longs_block_manual_not_counted(self):
+        ps = [self.pos(f"P{i}-USDT") for i in range(3)]
+        registry.save({p["instId"]: dict(instId=p["instId"], side="buy", position_createTime=p["createTime"]) for p in ps})
+        plan, why = EX.evaluate(SETUP, dict(self.ctx, pos=ps))
+        self.assertIsNone(plan); self.assertEqual(why, "direction cap 3/3")
+        registry.save({p["instId"]: dict(instId=p["instId"], side="buy", position_createTime=p["createTime"]) for p in ps[:2]})
+        plan, why = EX.evaluate(SETUP, dict(self.ctx, pos=ps))   # third long is manual: 2/3 bot, passes
+        self.assertIsNotNone(plan, why)
+        self.assertEqual(EX.bot_side_count("sell", ps), 0)
+    def test_unreadable_registry_fails_closed(self):
+        with open(config.data_path(registry.FILE), "w") as fh: fh.write("nope")
+        plan, why = EX.evaluate(SETUP, self.ctx)
+        self.assertIsNone(plan); self.assertTrue(why.startswith("direction cap check error"))
+
+class TestSlippageAndBE(NoNetwork):
+    def test_sizing_includes_slippage(self):
+        self.assertAlmostEqual(EX.risk_per_coin(100, 98), 2 + 0.0006 * 198 + 0.0018 * 100)
+        self.assertEqual(EX.size_for(1000, 100, 98, 1, "0.01"), float(int(50 / EX.risk_per_coin(100, 98) * 100) / 100))
+    def test_hard_cut_distance_solves_all_in(self):
+        import manage
+        for long_ in (True, False):
+            d = manage.hard_cut_distance(100.0, 10.0, long_, 1000.0)
+            stop = 100 - d if long_ else 100 + d
+            self.assertAlmostEqual(manage.loss_at(100.0, stop, 10.0), 0.055 * 1000, places=6)
+    def test_breakeven_price_round_trip_fees(self):
+        import manage
+        self.assertEqual(manage.breakeven_price(dict(averagePrice="8.4689", positions="1"), "0.0001"), 8.4791)   # 8.4689 x 1.0012 = 8.47906 -> up
+        self.assertEqual(manage.breakeven_price(dict(averagePrice="8.4689", positions="-1"), "0.0001"), 8.4587)  # x 0.9988 = 8.45874 -> down
+        self.assertEqual(manage.breakeven_price(dict(averagePrice="10", positions="1"), "0.01", dict(be_stop=10.05)), 10.05)  # recorded wins
+
+class TestCommodities(GateBase):
+    def test_commodity_allowed_stock_blocked_universe_any_class(self):
+        ins = dict(self.ins, **{"XAU-USDT": dict(INS["BTC-USDT"], instId="XAU-USDT", assetClass="Crypto")})
+        plan, why = EX.evaluate(dict(SETUP, instId="XAU-USDT"), dict(self.ctx, ins=ins))
+        self.assertIsNotNone(plan, why); self.assertEqual(plan["asset_class"], "commodity")
+        import scan
+        data = [dict(instId=i, state="live", offTime="", assetClass=c) for i, c in (("A-USDT", "Commodities"), ("B-USDT", "Stocks"), ("C-USDT", "Forex"))]
+        with mock.patch.object(bf, "public", return_value=dict(code="0", data=data)):
+            self.assertEqual(sorted(scan.tradable_instruments()), ["A-USDT", "B-USDT", "C-USDT"])

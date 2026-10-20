@@ -34,7 +34,7 @@ run code with __name__ == "__main__"):
   2. stop < entry < target (mirrored for shorts) and net R:R >= min_rr, stop/target rounded to tick
   3. stop distance >= min_stop_atr * atr_tolerance * 1H ATR
   4. 4H trend aligned (scan.py rule)
-  5. not a stock perp (entry.stock_perp_block) and 1H trend aligned (entry.trend_1h), same functions as execute.py
+  5. not a stock perp (entry.stock_perp_block), no re-entry cooldown, 1H trend aligned (entry.trend_1h), same functions as execute.py
   6. size >= minSize and a margin fit (leverage range, margin cap incl. margin freed by closing the
      old trade, liquidation well beyond the stop).
   Failures are logged once per cycle as FILTERED. Margin fit is re-checked per pair.
@@ -155,6 +155,8 @@ def entry_filters(c, ins, tk, equity, risk_usdt, now_dt):
     sw, how = EX.stockperp_check(i, meta)                  # mirrors execute.py entry.stock_perp_block
     flt.update(stock_perp=how, asset_class=EX.SP.asset_class(i, meta))
     if sw: flt["failed"].append("STOCK_PERP"); why.append(sw)
+    cw = EX.cooldown_block(i, eside)                         # mirrors execute.py re-entry cooldown
+    if cw: flt["failed"].append("COOLDOWN"); why.append(cw)
     tw, t1d = EX.trend1h_check(i, eside)                    # mirrors execute.py entry.trend_1h
     flt["trend1h"] = t1d
     if tw: flt["failed"].append("TREND1H"); why.append(tw)

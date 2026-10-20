@@ -206,7 +206,7 @@ class TestExecuteValidation(NoNetwork):
         self.assertIsNone(plan); self.assertIn("stock_perp", why)          # stock-perp block fires first
         ins = {"BTC-USDT": dict(INS["BTC-USDT"], assetClass="Commodities")}
         plan, why = EX.evaluate(dict(instId="BTC-USDT", side="buy", stop=101500, target=113000), dict(self.ctx, ins=ins))
-        self.assertIsNone(plan); self.assertIn("not a crypto perp", why)  # the crypto-only check still applies
+        self.assertIsNotNone(plan, why); self.assertEqual(plan["asset_class"], "commodity")  # commodities allowed, tagged
 
     def test_news_blocked_candidate_skipped_in_evaluate(self):
         with mock.patch.object(EX.news_gate, "check", return_value=dict(block=True, reason="fresh bearish rating, high confidence")), \
@@ -397,7 +397,7 @@ class TestManage(NoNetwork):
         self.assertTrue(r["ok"], r)
         self.assertEqual(fa.posts()[:2], ["/api/v1/trade/cancel-tpsl", "/api/v1/trade/order-tpsl"])
         self.assertEqual(r["place"]["req"]["tpTriggerPrice"], "106000")        # target kept
-        self.assertEqual(r["place"]["req"]["slTriggerPrice"], "100050")       # entry + 0.05%
+        self.assertEqual(r["place"]["req"]["slTriggerPrice"], "100120")       # entry + 2 x 0.06% taker fee (round trip)
         self.assertTrue(registry.load()["BTC-USDT"]["be_done"])
 
     def test_breakeven_ignores_stale_record_values(self):
@@ -468,7 +468,7 @@ class TestManage(NoNetwork):
         fa = FakeAccount(long_pos(mark="94000"), tpsl=[dict(tpslId="7", slTriggerPrice="90000")])
         r = self.run_with(fa, manage.hard_cut)
         self.assertEqual(len(r["closed"]), 1); self.assertIn("/api/v1/trade/close-position", fa.posts())
-        self.assertNotIn("BTC-USDT", registry.load())
+        self.assertEqual(registry.load()["BTC-USDT"]["close_by"], "cut")   # kept for the closed-trade log, pruned next run
 
     def test_hard_cut_never_widens(self):
         registry.save({"BTC-USDT": bot_rec()})

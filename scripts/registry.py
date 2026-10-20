@@ -51,12 +51,37 @@ def match(p, reg=None):
     rec = reg.get(p.get("instId"))
     return rec if matches(p, rec) else None
 
+PENDING = "closed_pending.json"   # pruned records waiting for their close line (closes.py), so no close is lost
+
+def load_pending():
+    try:
+        with open(config.data_path(PENDING)) as fh: d = json.load(fh)
+        return d if isinstance(d, list) else []
+    except FileNotFoundError: return []
+
+def save_pending(items):
+    p = config.data_path(PENDING); tmp = p + ".tmp"
+    with open(tmp, "w") as fh: json.dump(items, fh, indent=1, default=str)
+    os.replace(tmp, p)
+
+def load_strict():
+    """Like load() but raises if the file exists and can't be read (callers fail closed)."""
+    p = config.data_path(FILE)
+    if not os.path.exists(p): return {}
+    with open(p) as fh: reg = json.load(fh)
+    if not isinstance(reg, dict): raise ValueError(f"{FILE} is not a mapping")
+    return reg
+
 def prune_full(positions, reg=None):
-    """Drop records with no matching open position. Returns (registry, {instId: removed record})."""
+    """Drop records with no matching open position. Returns (registry, {instId: removed record}).
+    Removed records are queued in closed_pending.json for closes.py, whoever prunes (execute.py or manage.py)."""
     reg = load() if reg is None else reg
     keep = {k: v for k, v in reg.items() if any(matches(p, v) for p in positions)}
     removed = {k: v for k, v in reg.items() if k not in keep}
-    if removed: save(keep)
+    if removed:
+        pend = load_pending(); have = {(x.get("instId"), x.get("clientOrderId"), x.get("opened_at")) for x in pend}
+        pend += [v for v in removed.values() if (v.get("instId"), v.get("clientOrderId"), v.get("opened_at")) not in have]
+        save_pending(pend); save(keep)
     return keep, removed
 
 def prune(positions, reg=None):

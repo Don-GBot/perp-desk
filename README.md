@@ -23,7 +23,7 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 
 ## How the pieces fit
 
-1. `scripts/scan.py` ranks the top 25 crypto USDT perps by volume, drops wide spreads, keeps pairs in a 4H trend, and builds setups with R:R ≥ 3 after fees. Output: `data/scan.json`.
+1. `scripts/scan.py` ranks the top 25 USDT perps by volume (crypto, commodities, forex; stock perps are blocked later), drops wide spreads, keeps pairs in a 4H trend, and builds setups with R:R ≥ 3 after fees. Output: `data/scan.json`.
 2. `scripts/scanner.py` (optional) writes alerts and info-only flags to `data/flags_latest.json`.
 3. The news analyst rates each pair and writes `data/fundamentals.json`.
 4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, 1H trend gate, stock-perp block, caps), and opens at most one trade with `scripts/execute.py`. Every gate block is logged to `data/blocked_setups.jsonl`; `manage.py` writes run records, closed trades and funding paid.
@@ -53,7 +53,7 @@ Needs Python 3.9+. No pip packages (PyYAML is used if installed).
 
 Defaults live in `config.example.yaml`. To change them, copy it to `config.yaml` in the repo root (or point `BOT_CONFIG` at a file) and edit. Bad values stop the scripts with a clear error.
 
-**How much is at risk.** Each trade risks `risk_per_trade_pct` (default 5%) of equity at the stop, fees included. With `max_open: 4`, up to 4 × 5% = 20% of equity can be at risk at once. Gaps and slippage can make a loss bigger than planned. Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
+**How much is at risk.** Each trade risks `risk_per_trade_pct` (default 5%) of equity at the stop, fees and a 0.18% slippage buffer included. With `max_open: 4`, up to 4 × 5% = 20% of equity can be at risk at once. Gaps and slippage can make a loss bigger than planned. Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
 
 ## Adapting it to your harness
 

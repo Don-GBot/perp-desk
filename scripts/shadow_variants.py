@@ -4,7 +4,8 @@
 
 Each time DATA_DIR/scan.json gets a new ts, every variant walks the setups in scan order like execute.py does and logs
 one row per setup (variant, decision TAKE / SKIP / NOT_REACHED, reason, plan). Each variant keeps its OWN virtual book
-(one entry per scan, max_open / max_per_direction caps, no duplicate pair) and tracks each entry to TP / SL / BE /
+(one entry per scan, max_open / max_per_direction caps, no duplicate pair, its own re-entry cooldown after losing
+stop / trail / cut closes) and tracks each entry to TP / SL / BE /
 trailing stop / hard cut on closed 1m bars with the live exit rules from config.yaml. CLOSE rows carry R, pnl and an
 estimated funding cost (public funding-rate history x notional over the hold).
 
@@ -20,7 +21,6 @@ Books (config.yaml -> shadow_variants):
                  qualifying setups are walked by highest side-aligned z first
   V_CROWD        no longs in the crowd_n crypto pairs of the scan universe with the highest average funding over
                  crowd_hours, no shorts in the crowd_n lowest; a funding read failure blocks ('crowd (data error)')
-Note: STOCKS_ONLY only sees stock perps if scan.py emits them; the stock universe of scan.py is crypto-only by default.
 
   python3 scripts/shadow_variants.py           # scheduler: poll scan.json every poll_sec seconds
   python3 scripts/shadow_variants.py --once    # one pass then exit
@@ -136,6 +136,8 @@ def evaluate(v, s, book, mk, equity, scan_ts, now):
         except Exception as e: return 'SKIP', 'stock_perp (data error)', dict(pl, stock_error=str(e)[:160])
         if sm == 'block' and ist: return 'SKIP', f'stock_perp ({how})', pl
         if sm == 'only' and not ist: return 'SKIP', 'not stock_perp', pl
+    cu = book.setdefault('cooldown', {}).get(f'{inst}|{side}')
+    if cu and cu > ms(now): return 'SKIP', f'cooldown until {iso(dt.datetime.fromtimestamp(cu / 1000, dt.timezone.utc))} (variant book)', pl
     if sum(1 for p in book['open'] if p['side'] == side) >= EX.MAXDIR: return 'SKIP', 'direction cap (variant book)', pl
     if len(book['open']) >= EX.MAXALL: return 'SKIP', 'overall cap (variant book)', pl
     if any(p['inst'] == inst for p in book['open']): return 'SKIP', 'duplicate pair (variant book)', pl
@@ -212,9 +214,10 @@ def step_bars(pos, bars):
 def manage_step(pos, last, equity, a1_now, now_ms):
     """manage.py at a 15-min step: fee-inclusive hard cut, then break-even (stop to entry +/- buffer, trail to N x ATR)."""
     lg = pos['side'] == 'buy'; e = pos['entry']
-    if pos['coins'] * (((e - last) if lg else (last - e)) + EX.FEE * (e + last)) >= HARD_CUT * equity: return last, 'cut', now_ms
+    if pos['coins'] * (((e - last) if lg else (last - e)) + EX.FEE * (e + last) + EX.SLIP * e) >= HARD_CUT * equity: return last, 'cut', now_ms
     if not pos['be'] and ((lg and pos['best'] >= pos['trig']) or (not lg and pos['best'] <= pos['trig'])):
-        b = M['breakeven_buffer_pct'] / 100.0; bes = float(EX.q(e * (1 + b) if lg else e * (1 - b), pos['tick']))
+        b = M['breakeven_fee_legs'] * EX.FEE
+        bes = float(EX.q(e * (1 + b), pos['tick'], ROUND_UP)) if lg else float(EX.q(e * (1 - b), pos['tick'], ROUND_DOWN))
         if (lg and pos['sl'] < bes < last) or (not lg and last < bes < pos['sl']):
             pos['sl'] = bes; pos['cb'] = float(EX.q(M['breakeven_trail_atr'] * a1_now, pos['tick'])) if a1_now else pos['cb']
             pos['trail_on'] = True; pos['tbest'] = last
@@ -223,7 +226,7 @@ def manage_step(pos, last, equity, a1_now, now_ms):
 
 def close_row(pos, fill, kind, t_ms, mk):
     lg = pos['side'] == 'buy'; e = pos['entry']
-    pnl = ((fill - e) if lg else (e - fill)) - EX.FEE * (e + fill); rpc = pos['d'] + EX.FEE * (e + pos['stop0'])
+    pnl = ((fill - e) if lg else (e - fill)) - EX.FEE * (e + fill) - EX.SLIP * e; rpc = EX.risk_per_coin(e, pos['stop0'])
     row = dict(variant=pos['variant'], decision='CLOSE', scan_ts=pos['scan_ts'], rank=pos['rank'], pair=pos['inst'], side=pos['side'],
                kind=kind, entry=e, exit=fill, initial_stop=pos['stop0'], target=pos['target'], R=round(pnl / rpc, 4) if rpc else None,
                pnl_usdt=round(pnl * pos['coins'], 4), be_done=pos['be'], hold_min=round((t_ms - pos['t_entry']) / 60_000, 1),
@@ -231,6 +234,10 @@ def close_row(pos, fill, kind, t_ms, mk):
     try: row['funding_paid_est'] = SCW.funding_paid(mk.funding(pos['inst']), pos['side'], e * pos['coins'], pos['t_entry'], t_ms)
     except Exception as x: row['funding_paid_est'] = None; row['funding_error'] = str(x)[:120]
     return row
+
+def pnl_neg(pos, ex):
+    e = pos['entry']; fill = ex[0]
+    return (((fill - e) if pos['side'] == 'buy' else (e - fill)) - EX.FEE * (e + fill) - EX.SLIP * e) < 0
 
 def track(st, mk, equity, now):
     nowm = ms(now); n = 0
@@ -246,6 +253,8 @@ def track(st, mk, equity, now):
             if ex:
                 emit(close_row(pos, *ex, mk)); n += 1
                 book['open'].remove(pos); book['closed_n'] = book.get('closed_n', 0) + 1
+                if pnl_neg(pos, ex) and ex[1] in ('stop', 'trail', 'cut') and not pos['be'] and EX.COOLDOWN_H:
+                    book.setdefault('cooldown', {})[f"{pos['inst']}|{pos['side']}"] = ex[2] + int(EX.COOLDOWN_H * 3_600_000)
     return n
 
 def process_scan(st, mk, sc, equity, now):

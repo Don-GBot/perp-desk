@@ -10,6 +10,22 @@ Entry rules (both on in `config.example.yaml`; turn off in `config.yaml` if you 
   of exchange Stocks/Indices pairs, or assetClass Stocks/Indices for new listings). Checked first, fails closed.
   Open positions are never touched. `stockperp.asset_class()` tags pairs as stock / index / commodity / forex / crypto.
 
+Live rules from 2026-10-18/19, now in the repo (values as run live):
+- **Re-entry cooldown** (`risk.cooldown_hours: 4`): after a bot position closes at a loss by its stop-loss, trailing
+  stop or hard cut, no new entry on that pair in the same direction for 4h. Opposite direction allowed; wins,
+  break-even scratches, manual positions and manual closes don't trigger it. Read from `closed_trades.jsonl`
+  (`closes.cooldown_check`); a read error skips the entry. Mirrored in `shadow_swap.py` and every shadow book.
+- **Direction cap 3** (`risk.max_per_direction: 3`, was 4): counts open BOT positions per side only; manual positions
+  count toward `max_open` (4) only. A read error skips the entry.
+- **Break-even at round-trip fees** (`management.breakeven_fee_legs: 2`, replaces `breakeven_buffer_pct: 0.05`): BE stop =
+  entry x (1 +/- 2 x 0.06%), rounded to the tick in the trade's favour; a recorded `be_stop` keeps priority.
+- **Slippage buffer** (`fees.slip_frac: 0.0018`): added to the loss at the stop in sizing and in the hard cut
+  (loss per coin = |entry - stop| + fee x (entry + stop) + 0.18% x entry). Manual positions keep the price-only cut.
+- **Commodities and forex allowed**: `scan.py` no longer limits the universe to assetClass Crypto and `execute.py`
+  dropped its crypto-only check; only stock perps are blocked. Every pair is tagged with `asset_class`.
+- `manage.py` marks how it closed a position (`close_by`: cut / stop / manual); pruned records wait in
+  `closed_pending.json` until their close is logged, so a close seen first by `execute.py` is not lost.
+
 Logging (no rule change):
 - `blocked_setups.jsonl`: one line per news-gate, 1h-trend or stock-perp block (`scripts/blocklog.py`, also a CLI for
   the agent). New `execute.py --dry`; dry-run lines go to `logs/blocked_setups_dry.jsonl`, and a dry run never

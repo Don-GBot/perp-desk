@@ -10,12 +10,19 @@ Matching a positions-history row to a bot_positions.json record (close_fit):
     A tolerance, not equality: the exchange can report a createTime 1 ms off the one seen at entry.
   - one history row never closes two records in a run (consumed), and a row that fits another unresolved record on
     the same pair more closely is left for it (rivals).
+Pruned records wait in closed_pending.json (registry.py) until their row is found (kept up to PENDING_MAX_H hours).
+
+Close kind: the record's close_by when manage.py closed it ('cut' = hard cut, 'stop' = mark already past the stop,
+'manual' = close command), else from the result: a loss = 'stop' (exchange stop-loss or trailing stop), else 'tp'.
+Re-entry cooldown (cooldown_check): a close starts one when realized pnl < 0, kind is stop / trail / cut, and it is not
+a break-even scratch (be_done, or the exit at/beyond the recorded be_stop in the trade's favour). Manual closes don't.
 """
 import os, json, datetime as dt
 import config, registry
 
 PATH = '/api/v1/account/positions-history'
 FILE = 'closed_trades.jsonl'
+PENDING_MAX_H = 24
 
 def fnum(x, d=None):
     try: return float(x)
@@ -66,12 +73,77 @@ def pick(inst, rec, hist, consumed=None, rivals=()):
     consumed.add(hist_key(h))
     return h
 
+def close_kind(rec, pnl):
+    if rec.get('close_by'): return rec['close_by']
+    return 'stop' if pnl is not None and pnl < 0 else 'tp'
+
+def is_scratch(c):
+    if c.get('be_done') is True or c.get('kind') == 'be': return True
+    try: ex, bes = float(c.get('close_avg')), float(c.get('be_stop'))
+    except (TypeError, ValueError): return False
+    s = norm_side(c.get('side'))
+    return (ex >= bes) if s == 'long' else (ex <= bes) if s == 'short' else False
+
+def cooldown_trigger(c):
+    """(True, kind) if closed-trade line c starts a re-entry cooldown, else (False, why)."""
+    pnl = fnum(c.get('realized_pnl'))
+    if pnl is None: return False, 'pnl unknown'
+    if pnl >= 0: return False, 'not a loss'
+    if c.get('kind') not in ('stop', 'trail', 'cut'): return False, f"close by {c.get('kind')}, not a stop/trail/cut"
+    if is_scratch(c): return False, 'break-even scratch'
+    return True, c['kind']
+
+def load_closed(path=None):
+    out = []
+    try: fh = open(path or config.data_path(FILE))
+    except FileNotFoundError: return out
+    with fh:
+        for x in fh:
+            x = x.strip()
+            if x: out.append(json.loads(x))   # a corrupt line raises: callers skip the entry (fail closed)
+    return out
+
+def cooldown_check(inst, side, now=None, hours=4, path=None):
+    """dict(block, until, reason). No closed_trades.jsonl -> allowed. Unreadable -> raises."""
+    s = norm_side(side)
+    if s is None: raise ValueError(f'invalid side {side!r}')
+    now_ms = int((now or dt.datetime.now(dt.timezone.utc)).timestamp() * 1000); best = None
+    for c in load_closed(path):
+        if c.get('instId') != inst or norm_side(c.get('side')) != s or not c.get('close_ms'): continue
+        ok, kind = cooldown_trigger(c)
+        if not ok: continue
+        until = int(c['close_ms']) + int(hours * 3_600_000)
+        if until > now_ms and (best is None or until > best[0]): best = (until, kind, c)
+    if not best: return dict(block=False, until=None, reason='no cooldown')
+    u = dt.datetime.fromtimestamp(best[0] / 1000, dt.timezone.utc)
+    return dict(block=True, until=u.isoformat(), reason=f"cooldown until {u:%H:%M}Z (bot {best[1]} loss {best[2].get('realized_pnl')}; {hours:g}h same pair+side)")
+
+def record_pending(get, now_ms=None, funding_get=None):
+    """Process registry's closed_pending.json: log the matched ones, keep the rest (dropped after PENDING_MAX_H)."""
+    import time
+    now_ms = now_ms or int(time.time() * 1000)
+    pend = registry.load_pending()
+    if not pend: return [], []
+    by = {}
+    for r in pend: by.setdefault(r.get('instId'), []).append(r)
+    lines, errs = record(by, get, now_ms, funding_get)
+    done = {(x['instId'], x.get('clientOrderId'), x.get('opened_at')) for x in lines}
+    keep = []
+    for r in pend:
+        if (r.get('instId'), r.get('clientOrderId'), r.get('opened_at')) in done: continue
+        since = registry.iso_ms(r.get('pending_since')) or now_ms
+        if now_ms - since <= PENDING_MAX_H * 3_600_000:
+            r.setdefault('pending_since', dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone.utc).isoformat()); keep.append(r)
+        else: errs.append(f"close {r.get('instId')}: no history row after {PENDING_MAX_H}h, dropped")
+    registry.save_pending(keep)
+    return lines, errs
+
 def record(removed, get, now_ms=None, funding_get=None):
-    """removed: {instId: record} pruned this run. get(path, params) -> data list. Appends one line per matched close.
+    """removed: {instId: record or [records]}. get(path, params) -> data list. Appends one line per matched close.
     Returns (lines, errors). Never raises."""
     lines, errs, consumed = [], [], set()
     by_inst = {}
-    for inst, rec in (removed or {}).items(): by_inst.setdefault(inst, []).append(rec)
+    for inst, rec in (removed or {}).items(): by_inst.setdefault(inst, []).extend(rec if isinstance(rec, list) else [rec])
     for inst, recs in by_inst.items():
         try: hist = get(PATH, {'instId': inst, 'limit': '50'})
         except Exception as e: errs.append(f'close {inst}: history unreadable: {str(e)[:160]}'); continue
@@ -82,8 +154,9 @@ def record(removed, get, now_ms=None, funding_get=None):
                         position_createTime=rec.get('position_createTime'), positionId=h.get('positionId'),
                         open_avg=fnum(h.get('openAveragePrice')), close_avg=fnum(h.get('closeAveragePrice')),
                         realized_pnl=fnum(h.get('realizedPnl')), fee=fnum(h.get('fee')), close_ms=int(fnum(h.get('updateTime'), 0) or 0),
-                        initial_stop=rec.get('initial_stop'), target=rec.get('target'), be_done=rec.get('be_done'),
+                        initial_stop=rec.get('initial_stop'), target=rec.get('target'), be_done=rec.get('be_done'), be_stop=rec.get('be_stop'),
                         asset_class=rec.get('asset_class'), logged_utc=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+            line['kind'] = close_kind(rec, line['realized_pnl'])
             if funding_get is not None:
                 try:
                     import funding

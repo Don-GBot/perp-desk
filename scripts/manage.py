@@ -28,8 +28,12 @@ Only values from a matching record (initial_stop, target, stop_dist, equity_at_e
 With bot.protect_manual_trades: true (default), the hard cut, break-even, tighten and close only act
 on bot positions; manual positions only get a missing-stop alert. `close --force` overrides for a human.
 
-Hard cut: loss at the stop INCLUDING entry and exit taker fees may not exceed hard_cut_pct of the
-equity at entry (from the record; wallet balance without unrealized PnL as fallback).
+Hard cut: loss at the stop INCLUDING entry and exit taker fees AND the slippage buffer (fees.slip_frac x entry, the
+same terms as execute.py sizing) may not exceed hard_cut_pct of the equity at entry (from the record; wallet balance
+without unrealized PnL as fallback). It only ever tightens a stop, and closes at market if the cut stop is at or past price.
+
+Break-even: stop to entry +/- management.breakeven_fee_legs x taker_rate (2 x 0.06% = 0.12%: round-trip fees, so a BE
+exit nets about 0), rounded to the tick in the trade's favour. A be_stop already stored on the record keeps priority.
 
 Endpoints (Blofin public API docs):
   POST /api/v1/trade/close-position   {instId, marginMode, positionSide, clientOrderId}
@@ -49,7 +53,7 @@ from scan import candles, atr
 C = config.CFG; M = C["management"]; PREFIX = C["bot"]["client_order_prefix"]
 PROTECT_MANUAL = bool(C["bot"]["protect_manual_trades"])
 HARD_CUT = C["risk"]["hard_cut_pct"] / 100.0
-FEE = EX.FEE
+FEE = EX.FEE; SLIP = EX.SLIP
 WINDOW_MS = registry.MATCH_WINDOW_MS
 
 def _get(path, params=None):
@@ -162,7 +166,7 @@ def replace_stop(p, new_sl, keep_tp=True):
         out['why'] += '; there was no old stop: POSITION IS UNPROTECTED'; out['unprotected'] = True
     return out
 
-def close_position(inst, force=False, reg=None):
+def close_position(inst, force=False, reg=None, by='manual'):
     p = position(inst)
     if not p: return dict(ok=False, instId=inst, why='no open position')
     if PROTECT_MANUAL and not force and not is_bot_position(p, reg):
@@ -174,12 +178,15 @@ def close_position(inst, force=False, reg=None):
     if out['ok']:
         try: cancel_trail(inst)  # the exchange usually cancels it; this is a cleanup
         except Exception: pass
-        rg = registry.load()
-        if inst in rg: rg.pop(inst); registry.save(rg)
+        rg = registry.load()   # mark how it closed; the next prune queues it for the closed-trade log (closes.py)
+        if inst in rg and registry.matches(p, rg[inst]): rg[inst]['close_by'] = by; registry.save(rg)
     return out
 
-def breakeven_price(p, tick):
-    avg = float(p['averagePrice']); buf = M['breakeven_buffer_pct'] / 100.0
+def breakeven_price(p, tick, rec=None):
+    """entry x (1 +/- legs x taker fee) rounded in the trade's favour; a recorded be_stop keeps priority."""
+    if rec and rec.get('be_stop'): return float(rec['be_stop'])
+    from decimal import Decimal
+    avg = Decimal(str(p['averagePrice'])); buf = Decimal(str(M['breakeven_fee_legs'])) * Decimal(str(FEE))
     if is_long(p): return float(EX.q(avg * (1 + buf), tick, ROUND_UP))
     return float(EX.q(avg * (1 - buf), tick, ROUND_DOWN))
 
@@ -194,7 +201,7 @@ def move_stop_to_breakeven(inst, check_trigger=True, reg=None):
     if PROTECT_MANUAL and not bot: return dict(ok=False, instId=inst, why='manual position: break-even not applied (protect_manual_trades)')
     tick = _instrument(inst)['tickSize']; long_ = is_long(p)
     avg = float(p['averagePrice']); mark = float(p.get('markPrice') or 0)
-    old_sl = _stop_of(pending_tpsl(inst)); be = breakeven_price(p, tick)
+    old_sl = _stop_of(pending_tpsl(inst)); be = breakeven_price(p, tick, rec)
     if old_sl is not None and ((long_ and old_sl >= be) or (not long_ and old_sl <= be)):
         return dict(ok=True, instId=inst, note=f'stop {old_sl:g} already at or past break-even {be:g}')
     if check_trigger:
@@ -216,7 +223,7 @@ def move_stop_to_breakeven(inst, check_trigger=True, reg=None):
     except Exception as e: out['warning'] = f'trail step failed: {str(e)[:200]}'
     if rec:
         rg = registry.load()
-        if inst in rg: rg[inst]['be_done'] = True; registry.save(rg)
+        if inst in rg: rg[inst]['be_done'] = True; rg[inst]['be_stop'] = be; registry.save(rg)
     return out
 
 def tighten_stop(inst, price, reg=None):
@@ -238,15 +245,15 @@ def wallet_balance():
     if not d: raise RuntimeError('balance unreadable')
     return float(d[0].get('balance') or d[0]['equity'])   # cash balance excludes unrealized PnL
 
-def hard_cut_distance(avg, coin, long_, equity, hc=HARD_CUT, fee=FEE):
-    """Price distance d from avg so that loss at the stop incl. entry + exit taker fees = hc x equity.
-    long: coin*d + fee*coin*(avg + avg - d) = L  ->  d = (L/coin - 2*fee*avg) / (1 - fee)
-    short: coin*d + fee*coin*(avg + avg + d) = L ->  d = (L/coin - 2*fee*avg) / (1 + fee)"""
+def hard_cut_distance(avg, coin, long_, equity, hc=HARD_CUT, fee=FEE, slip=SLIP):
+    """Price distance d from avg so that loss at the stop incl. entry + exit taker fees + slippage = hc x equity.
+    long: coin*(d + fee*(2avg - d) + slip*avg) = L  ->  d = (L/coin - 2*fee*avg - slip*avg) / (1 - fee)
+    short: coin*(d + fee*(2avg + d) + slip*avg) = L ->  d = (L/coin - 2*fee*avg - slip*avg) / (1 + fee)"""
     L = hc * equity
-    return (L / coin - 2 * fee * avg) / ((1 - fee) if long_ else (1 + fee))
+    return (L / coin - 2 * fee * avg - slip * avg) / ((1 - fee) if long_ else (1 + fee))
 
-def loss_at(avg, stop, coin, fee=FEE):
-    return coin * abs(avg - stop) + fee * coin * (avg + stop)
+def loss_at(avg, stop, coin, fee=FEE, slip=SLIP):
+    return coin * EX.risk_per_coin(avg, stop, fee, slip)
 
 def _cut_basis(rec, wallet):
     return float(rec['equity_at_entry']) if rec and rec.get('equity_at_entry') else wallet
@@ -261,15 +268,16 @@ def hard_cut(reg=None):
         coin = abs(float(p['positions'])) * float(ins['contractValue'])
         avg = float(p['averagePrice']); mark = float(p.get('markPrice') or avg)
         basis = _cut_basis(rec, wallet); limit = HARD_CUT * basis
-        open_loss = loss_at(avg, mark, coin) if _past(long_, avg, mark) else 0.0   # loss incl. fees if closed now
-        d = hard_cut_distance(avg, coin, long_, basis)
+        f, sp = (FEE, SLIP) if bot else (0.0, 0.0)   # bot: all in (fees + slippage); manual (protect off): price only
+        open_loss = loss_at(avg, mark, coin, f, sp) if _past(long_, avg, mark) else 0.0   # loss if closed now
+        d = hard_cut_distance(avg, coin, long_, basis, fee=f, slip=sp)
         if open_loss >= limit or d <= 0:
-            r = close_position(inst, reg=reg)
+            r = close_position(inst, reg=reg, by='cut')
             (out['closed'] if r['ok'] else out['errors']).append(dict(instId=inst, loss_now=round(open_loss, 4), limit=round(limit, 4), why=r.get('why') or 'HARD CUT BREACHED: closed'))
             continue
         hc = float(EX.q(avg - d if long_ else avg + d, tick, ROUND_UP if long_ else ROUND_DOWN))
         if _past(long_, hc, mark):
-            r = close_position(inst, reg=reg)
+            r = close_position(inst, reg=reg, by='cut')
             (out['closed'] if r['ok'] else out['errors']).append(dict(instId=inst, hard_cut_stop=hc, mark=mark, why=r.get('why') or 'mark already past the hard-cut stop: closed'))
             continue
         sl = _stop_of(pending_tpsl(inst))
@@ -297,7 +305,7 @@ def ensure_stops(reg=None):
         sl = max(cand) if long_ else min(cand)                     # the tighter of initial stop and hard cut
         sl = float(EX.q(sl, tick, ROUND_UP if long_ else ROUND_DOWN))
         if d <= 0 or _past(long_, sl, mark):
-            r = close_position(inst, reg=reg)
+            r = close_position(inst, reg=reg, by='stop')
             entry = dict(instId=inst, stop=sl, mark=mark, why=f'NO STOP and mark already past the stop {sl:g}: CLOSED AT MARKET' if r['ok'] else r.get('why'))
             (out['closed'] if r['ok'] else out['errors']).append(entry); continue
         r = place_tpsl(p, sl=sl, tp=rec.get('target') if rec else None)
@@ -336,7 +344,7 @@ def bookkeeping(removed, reg):
     """Closed-trade lines + funding + nothing else. Never raises; returns a dict for the output."""
     out = dict(closes=[], funding_errors=[], errors=[])
     try:
-        lines, errs = closes.record(removed, _get, funding_get=_get if LG['funding'] else None)
+        lines, errs = closes.record_pending(_get, funding_get=_get if LG['funding'] else None)   # removed are queued there
         out['closes'] = [dict(instId=x['instId'], positionId=x.get('positionId'), realized_pnl=x.get('realized_pnl')) for x in lines]
         out['errors'] += errs
     except Exception as e: out['errors'].append(f'close log failed: {str(e)[:160]}')

@@ -23,12 +23,19 @@ risk:
   # any position already down this much. With protect_manual_trades it only touches bot positions.
   # Must be >= risk_per_trade_pct. Keep it a bit above to leave room for slippage.
   hard_cut_pct: 5.5
-  # Max open positions overall, and per direction (long / short).
+  # Max open positions overall (all positions, manual included), and max open BOT positions per
+  # direction (long / short; manual positions are not counted). Entry-only: never closes anything.
+  # If the bot positions can't be read, the entry is skipped.
   max_open: 4
-  max_per_direction: 4
+  max_per_direction: 3
+  # Re-entry cooldown: after a bot position closes at a loss by its stop-loss, trailing stop or hard cut,
+  # no new entry on that pair in the same direction for this many hours from the close. The opposite
+  # direction is allowed. Wins, break-even scratches (break-even already moved), manual positions and
+  # manual closes don't trigger it. 0 turns it off.
+  cooldown_hours: 4
   # At most one new position per executor run.
   one_new_open_per_run: true
-  # Worst case: max_open x risk_per_trade_pct of equity at risk at once (4 x 5% = 20%).
+  # Worst case: max_open x risk_per_trade_pct of equity at risk at once (4 x 5% = 20%), plus slippage.
 
 # ---------------------------------------------------------------------------
 # Fees
@@ -37,6 +44,11 @@ fees:
   # Taker fee per side as a fraction (0.0006 = 0.06%). Used in the R:R check and in sizing, so a
   # clean stop-out loses about risk_per_trade_pct of equity including entry and exit fees.
   taker_rate: 0.0006
+  # Slippage buffer as a fraction of entry (0.0018 = 0.18%), added to the loss at the stop in sizing and in
+  # the hard cut: loss per coin = |entry - stop| + taker_rate x (entry + stop) + slip_frac x entry.
+  # 0.0018 was the 90th percentile of adverse stop-fill slippage seen live. Outliers beyond it are left
+  # to the hard cut, which cannot catch slippage inside the exchange's own stop fill.
+  slip_frac: 0.0018
 
 # ---------------------------------------------------------------------------
 # Bot identity and manual trades
@@ -91,8 +103,9 @@ entry:
 # Setup scanner (scripts/scan.py)
 # ---------------------------------------------------------------------------
 scan:
-  # Universe: live Crypto USDT perps (no stocks/commodities/indices, nothing scheduled for
-  # delisting), top N by 24h quote volume...
+  # Universe: live USDT perps of any asset class (nothing scheduled for delisting), top N by 24h
+  # quote volume. Stock perps are then blocked by entry.stock_perp_block; commodities and forex are
+  # allowed and tagged (asset_class)...
   universe_size: 25
   # ...then drop pairs whose bid/ask spread is wider than this percent of last price.
   max_spread_pct: 0.1
@@ -132,10 +145,11 @@ management:
   trail_activate_r: 1.0
   trail_callback_atr: 1.5
   # Break-even: once price has moved breakeven_at_r x initial stop distance in favor, move the
-  # stop to entry +/- breakeven_buffer_pct (fee buffer), keep the target, tighten the trail to
-  # breakeven_trail_atr x ATR. Once per position.
+  # stop to entry +/- breakeven_fee_legs x taker_rate (2 x 0.06% = 0.12%, the round-trip fees), rounded
+  # to the tick in the trade's favor, so a break-even exit nets about 0. Keep the target, tighten the
+  # trail to breakeven_trail_atr x ATR. Once per position.
   breakeven_at_r: 0.75
-  breakeven_buffer_pct: 0.05
+  breakeven_fee_legs: 2
   breakeven_trail_atr: 1.0
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,11 @@ Per run:
     1H trend aligned with the side (entry.trend_1h, trend1h.py; flat blocks both sides, a data error skips);
     size >= instrument min; a leverage in [min, max] that fits the margin cap; liquidation well beyond the stop.
   - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop.
-Sizing: a clean stop-out loses about risk_per_trade_pct of equity INCLUDING entry and exit taker fees.
+Sizing: a clean stop-out loses about risk_per_trade_pct of equity INCLUDING entry and exit taker fees and a slippage
+buffer (fees.slip_frac x entry): loss per coin = |entry - stop| + taker_rate x (entry + stop) + slip_frac x entry.
+Direction cap: max_per_direction counts open BOT positions only (bot_positions.json matches); manual positions count
+toward max_open only. Re-entry cooldown: no entry on a pair+side within risk.cooldown_hours of a losing bot stop /
+trail / hard-cut close (closes.cooldown_check). Either check failing to read is a skip, never a pass.
 
 Once an order is accepted the result is ok:true, written to DATA_DIR/exec_last.json right away, and any
 later problem (position not visible yet, trailing stop rejected) is reported under "warnings".
@@ -39,7 +43,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
 import config, lock, registry, news_gate
-import trend1h as T1, stockperp as SP, blocklog as BL
+import trend1h as T1, stockperp as SP, blocklog as BL, closes
 
 def _load_json(path):
     with open(path) as fh:
@@ -48,7 +52,8 @@ from scan import candles, atr, trend, net_rr
 
 C = config.CFG; R_ = C["risk"]; E = C["entry"]; LV = C["leverage"]; M = C["management"]
 RISK = R_["risk_per_trade_pct"] / 100.0
-FEE = float(C["fees"]["taker_rate"])
+FEE = float(C["fees"]["taker_rate"]); SLIP = float(C["fees"]["slip_frac"])
+COOLDOWN_H = float(R_["cooldown_hours"])
 PREFIX = C["bot"]["client_order_prefix"]
 MAXDIR = int(R_["max_per_direction"]); MAXALL = int(R_["max_open"]); MINRR = float(E["min_rr"])
 ATR_FLOOR = float(E["min_stop_atr"]) * float(E["atr_tolerance"])
@@ -77,12 +82,16 @@ def est_liq(entry, side, L, mmr=MMR_DEFAULT):
     # isolated liq estimate: long = entry*(1-1/L+mmr), short = entry*(1+1/L-mmr) (fees ignored)
     d = entry * (1.0 / L - mmr); return entry + d if side == 'sell' else entry - d
 
-def loss_per_contract(entry, stop, cv, fee=FEE):
-    """Loss of one contract at the stop, including entry and exit taker fees."""
-    return cv * (abs(entry - stop) + fee * (entry + stop))
+def risk_per_coin(entry, stop, fee=FEE, slip=SLIP):
+    """Loss of one coin at the stop: price distance + taker fee on entry and exit + slippage buffer."""
+    return abs(entry - stop) + fee * (entry + stop) + slip * entry
 
-def size_for(equity, entry, stop, cv, lot, fee=FEE):
-    per = loss_per_contract(entry, stop, cv, fee)
+def loss_per_contract(entry, stop, cv, fee=FEE, slip=SLIP):
+    """Loss of one contract at the stop, including entry and exit taker fees and the slippage buffer."""
+    return cv * risk_per_coin(entry, stop, fee, slip)
+
+def size_for(equity, entry, stop, cv, lot, fee=FEE, slip=SLIP):
+    per = loss_per_contract(entry, stop, cv, fee, slip)
     return float(q((equity * RISK) / per, lot, ROUND_DOWN)) if per > 0 else 0.0
 
 def norm_side(s):
@@ -156,6 +165,23 @@ def log_block(setup, gate_reason, reason, ctx, extra=None):
         BL.append(line)
     except Exception as e: ctx.setdefault('warnings', []).append(f'blocked_setups log failed: {str(e)[:160]}')
 
+def cooldown_block(inst, side, now=None):
+    """None if the pair+side may be entered, else the SKIP reason. A read error is a skip."""
+    if not COOLDOWN_H: return None
+    try: cd = closes.cooldown_check(inst, side, now, COOLDOWN_H)
+    except Exception as e: return f'cooldown check error: {str(e)[:160]}'
+    return cd['reason'] if cd['block'] else None
+
+def bot_side_count(side, pos, reg=None):
+    """Open BOT positions on side ('buy'/'sell'): exchange positions with a matching bot_positions.json record."""
+    reg = registry.load_strict() if reg is None else reg
+    return sum(1 for p in pos if (float(p['positions']) > 0) == (side == 'buy') and registry.match(p, reg))
+
+def dircap_block(side, pos):
+    try: n = bot_side_count(side, pos)
+    except Exception as e: return f'direction cap check error: {str(e)[:160]}'
+    return f'direction cap {n}/{MAXDIR}' if n >= MAXDIR else None
+
 # ---- per-setup evaluation ----------------------------------------------------------------------
 def evaluate(setup, ctx):
     """Returns (plan, None) if this setup can be traded now, else (None, reason)."""
@@ -165,16 +191,17 @@ def evaluate(setup, ctx):
     except Exception: return None, 'bad setup: stop/target missing or not numeric'
     pos = ctx['pos']
     if any(p['instId'] == inst for p in pos): return None, 'pair already has a position'
-    n_side = sum(1 for p in pos if (float(p['positions']) > 0) == (side == 'buy'))
-    if n_side >= MAXDIR: return None, 'direction cap'
     ins = ctx['ins'].get(inst)
     sw, how = stockperp_check(inst, ins)
     if sw:
         log_block(setup, 'stock_perp (data error)' if 'data error' in sw else 'stock_perp', sw, ctx, dict(detail=how))
         return None, sw
+    why = cooldown_block(inst, side)
+    if why: return None, why
+    why = dircap_block(side, pos)
+    if why: return None, why
     if not ins: return None, 'instrument not found'
     if ins.get('state') not in (None, 'live') or ins.get('offTime'): return None, 'instrument not live or scheduled for delisting'
-    if ins.get('assetClass') != 'Crypto': return None, f'not a crypto perp (assetClass {ins.get("assetClass")!r})'
     ng = news_gate.check(inst, side)
     if ng.get('block'):
         log_block(setup, 'news_gate', ng['reason'], ctx)
@@ -210,11 +237,12 @@ def evaluate(setup, ctx):
     liq = est_liq(entry, side, lev, float(ins.get('maintenanceMarginRate') or MMR_DEFAULT))
     if risk >= MAX_STOP_TO_LIQ * abs(liq - entry):
         return None, f'liq {liq:.8g} too close: stop dist {risk:.8g} >= {MAX_STOP_TO_LIQ:g} x liq dist {abs(liq-entry):.8g} at {lev}x'
-    if pair_positions(inst): return None, 'existing position on pair; leverage untouched'
+    live = pair_positions(inst)
+    if live: return None, 'existing position on pair; leverage untouched'
     coid = bf.client_order_id(PREFIX)
     plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr_net=rr,
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
-                stop_dist=risk, fee_rate=FEE, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
+                stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
                 lev_req=dict(instId=inst, leverage=str(lev), marginMode=NEW_MM, positionSide='net'),
                 order_req=dict(instId=inst, marginMode=NEW_MM, positionSide='net', side=side, orderType='market',
                                size=fs(size), tpTriggerPrice=fs(target), tpOrderPrice='-1', slTriggerPrice=fs(stop),
@@ -283,7 +311,7 @@ def place(plan):
     write_json('exec_last.json', out)
     rec = dict(instId=inst, side=side, clientOrderId=plan['order_req']['clientOrderId'], opened_at=out['accepted_at'],
                entry_quote=plan['entry'], initial_stop=plan['stop'], target=plan['target'], stop_dist=plan['stop_dist'],
-               atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False)
+               atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False, asset_class=plan.get('asset_class'))
     try: registry.put(rec)
     except Exception as e: out['warnings'].append(f'bot_positions.json not updated: {e}')
     p = []
