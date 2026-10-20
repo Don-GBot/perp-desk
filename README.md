@@ -19,14 +19,15 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 | Manager | `prompts/manager.md` | daily + weekly | no |
 | Alerts scanner (optional) | `prompts/scanner.md` | step 0 of the Executor, or :00/:30 | no |
 | Shadow swap logger | none, plain script | every 15 min from cron | never |
+| Shadow filter variants | none, plain script | every 5 min from cron | never |
 
 ## How the pieces fit
 
 1. `scripts/scan.py` ranks the top 25 crypto USDT perps by volume, drops wide spreads, keeps pairs in a 4H trend, and builds setups with R:R ≥ 3 after fees. Output: `data/scan.json`.
 2. `scripts/scanner.py` (optional) writes alerts and info-only flags to `data/flags_latest.json`.
 3. The news analyst rates each pair and writes `data/fundamentals.json`.
-4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, caps), and opens at most one trade with `scripts/execute.py`.
-5. `scripts/shadow_swap.py` logs whether swapping an open trade for a new setup would have paid. It never trades.
+4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, 1H trend gate, stock-perp block, caps), and opens at most one trade with `scripts/execute.py`. Every gate block is logged to `data/blocked_setups.jsonl`; `manage.py` writes run records, closed trades and funding paid.
+5. `scripts/shadow_swap.py` logs whether swapping an open trade for a new setup would have paid. `scripts/shadow_variants.py` runs the same setups through alternative filter sets in virtual books. Neither ever trades.
 6. The Manager audits everything against `RULEBOOK.md` and the logs.
 
 See `docs/architecture.md` for the diagram.
@@ -44,8 +45,9 @@ Needs Python 3.9+. No pip packages (PyYAML is used if installed).
    ```sh
    python3 scripts/scan.py     # writes data/scan.json
    ```
-3. Run the executor. This places a real order if a setup passes every check:
+3. Try a dry run first (every check, nothing placed), then the real executor, which places a real order if a setup passes every check:
    ```sh
+   python3 scripts/execute.py --dry
    python3 scripts/execute.py
    ```
 
@@ -70,9 +72,11 @@ config.example.yaml   every tunable value, with comments
 RULEBOOK.md           the rules, in plain words
 prompts/              one role prompt per agent
 scripts/              Python scripts (stdlib only): scan, scanner, execute, manage, news_gate, shadow_swap,
-                      plus blofin_client, config and lock helpers
+                      shadow_variants, transfers, runlog, blocklog, plus helpers: trend1h, stockperp,
+                      slowcrowd, closes, funding, registry, blofin_client, config, lock
 docs/                 architecture, scheduling, usage costs
 tests/                offline unit tests (no network, no orders)
+CHANGELOG.md          what changed, by date
 examples/             fundamentals.json format
 run.sh                wrapper for cron/systemd (loads .env)
 ```

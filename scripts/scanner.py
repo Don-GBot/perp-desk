@@ -22,8 +22,16 @@ Files (DATA_DIR):
   scanner_state.json    alert memory / dedupe
   scanner_log.jsonl     one JSON line per run
 Prints a short JSON summary to stdout.
+
+Run guards:
+  - One pass at a time: DATA_DIR/scanner.lock is held (flock) until the process exits. If another pass holds it, the
+    script prints "SKIP: locked" and exits 0 without writing anything.
+  - A full pass within the last 5 min (scanner_state.json last_run) -> "SKIP: ran Ns ago", exit 0 (harnesses double-run).
+  - If EVERY flag check errored (e.g. exchange down), flags_latest.json is kept as is, the summary carries scanner_error,
+    and last_run is not advanced, so the next run retries at once. A dedup-only empty pass also keeps the previous flags.
+    A genuine pass with zero flags still writes [].
 """
-import os, sys, json, datetime as dt
+import os, sys, json, fcntl, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
 import config
@@ -36,8 +44,18 @@ import scan as executor_scan   # side-effect free on import
 SC = config.CFG["scanner"]
 STATE = config.data_path('scanner_state.json'); LOG = config.data_path('scanner_log.jsonl')
 FLAGS_LATEST = config.data_path('flags_latest.json')
+MIN_GAP_S = 300
+_lock_fd = os.open(config.data_path('scanner.lock'), os.O_CREAT | os.O_RDWR, 0o644)
+try: fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError: print('SKIP: locked'); sys.exit(0)
 st = _load_json(STATE) if os.path.exists(STATE) else {}
 now = dt.datetime.now(dt.timezone.utc)
+try: _last = dt.datetime.fromisoformat(str(st.get('last_run')).replace('Z', '+00:00'))
+except Exception: _last = None
+if _last is not None:
+    if _last.tzinfo is None: _last = _last.replace(tzinfo=dt.timezone.utc)
+    _age = (now - _last).total_seconds()
+    if 0 <= _age < MIN_GAP_S: print(f'SKIP: ran {int(_age)}s ago (<5 min)'); sys.exit(0)
 now_iso = now.isoformat()
 cutoff = (now - dt.timedelta(hours=SC["memory_hours"])).isoformat()
 errors = []
@@ -135,31 +153,42 @@ def compute_flags(inst):
 
 flag_key_cutoff = (now - dt.timedelta(hours=2)).isoformat()
 flag_keys = {k: v for k, v in st.get('flag_keys', {}).items() if v >= flag_key_cutoff}
-flags = []; flag_errors = []
+flags = []; flag_errors = []; n_dedup = 0; n_checks = 0
 for r in top:
     if r['qv'] < SC["flag_min_quote_vol_usd"]: continue
+    n_checks += 1
     try:
         for f in compute_flags(r['inst']):
             k = '%s|%s|%s' % (f['pair'], f['type'], f['candle_close_time'])
-            if k in flag_keys: continue
+            if k in flag_keys: n_dedup += 1; continue
             flag_keys[k] = f['candle_close_time']
             flags.append(f)
     except Exception as e: flag_errors.append(dict(pair=r['inst'], error=str(e)[:200]))
 FLAGS_NOTE = 'INFO ONLY - NOT setups, NOT trade triggers'
-try:
-    _tmp = FLAGS_LATEST + '.tmp'
-    with open(_tmp, 'w') as _f: json.dump(dict(ts=now_iso, note=FLAGS_NOTE, bar=BAR, closed_candles_only=True, flags=flags, errors=flag_errors), _f, indent=1)
-    os.replace(_tmp, FLAGS_LATEST)
-except Exception as e: flag_errors.append(dict(pair=None, error='flags_latest write failed: ' + str(e)[:200]))
+all_failed = n_checks > 0 and len(flag_errors) == n_checks
+scanner_error = f'all {n_checks} flag checks failed; flags_latest kept' if all_failed else None
+flags_latest_action = 'written'
+if all_failed: flags_latest_action = 'kept (all flag checks failed)'
+elif not flags and n_dedup > 0 and os.path.exists(FLAGS_LATEST): flags_latest_action = f'kept (dedup-only empty pass: {n_dedup})'
+else:
+    try:
+        _tmp = FLAGS_LATEST + '.tmp'
+        with open(_tmp, 'w') as _f:
+            json.dump(dict(ts=now_iso, note=FLAGS_NOTE, bar=BAR, closed_candles_only=True, flags=flags, errors=flag_errors), _f, indent=1); _f.flush(); os.fsync(_f.fileno())
+        os.replace(_tmp, FLAGS_LATEST)
+    except Exception as e: flag_errors.append(dict(pair=None, error='flags_latest write failed: ' + str(e)[:200])); flags_latest_action = 'write failed'
 errors += flag_errors
 
-st.update(universe=[r['inst'] for r in top], moves_v2=mv2, last_run=now_iso, universe_seen=seen, coils_seen=cseen, flag_keys=flag_keys)
+st.update(universe=[r['inst'] for r in top], moves_v2=mv2, universe_seen=seen, coils_seen=cseen, flag_keys=flag_keys)
+if not all_failed: st['last_run'] = now_iso   # last FULL pass only
 _tmp = STATE + '.tmp'
-with open(_tmp, 'w') as _f: json.dump(st, _f, indent=1)
+with open(_tmp, 'w') as _f: json.dump(st, _f, indent=1); _f.flush(); os.fsync(_f.fileno())
 os.replace(_tmp, STATE)
 brief = [{k: f[k] for k in ('pair', 'type', 'direction', 'candle_close_time', 'price', 'volume_multiple')} for f in flags]
 with open(LOG, 'a') as f:
-    f.write(json.dumps(dict(ts=now_iso, pairs=[r['inst'] for r in top], moves=moves, newtop=newtop, coils=new_coils, flags=brief, errors=errors)) + '\n')
+    f.write(json.dumps(dict(ts=now_iso, pairs=[r['inst'] for r in top], moves=moves, newtop=newtop, coils=new_coils, flags=brief, errors=errors, **({'scanner_error': scanner_error} if scanner_error else {}))) + '\n')
 
 print(json.dumps(dict(ts=now_iso, pairs=len(top), moves=moves, newtop=newtop, new_coils=new_coils,
-                      flags=dict(note=FLAGS_NOTE, items=brief), errors=errors), indent=1))
+                      flags=dict(note=FLAGS_NOTE, items=brief), flags_latest=flags_latest_action, errors=errors,
+                      **({'scanner_error': scanner_error} if scanner_error else {})), indent=1))
+os.close(_lock_fd)

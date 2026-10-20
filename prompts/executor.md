@@ -27,6 +27,10 @@ Use the scripts for every order. Do not write order bodies or call order endpoin
 | `python3 scripts/news_gate.py PAIR SIDE` | `{"block": true/false, "reason": ...}`. For your report only; `execute.py` runs the same check itself. |
 | `python3 scripts/scan.py` | Refreshes `scan.json`. |
 | `python3 scripts/execute.py [--inst PAIR]` | Checks setups best-first and opens at most one trade. |
+| `python3 scripts/execute.py --dry` | Same checks, prints the plan, places nothing. Its blocks go to the dry log only. |
+| `python3 scripts/runlog.py annotate --run-id ID --json '{...}'` | Attach your run notes to the run record `manage.py` wrote (its `run_id`). Do not hand-write run records. |
+| `python3 scripts/blocklog.py add ...` | Log a setup you blocked yourself. `execute.py` logs its own blocks. |
+| `python3 scripts/transfers.py detect --since ISO` | Lists deposits/withdrawals not yet logged. Equity changes from transfers are not PnL. |
 
 All output is JSON. Read the `ok`, `why`, `warnings` and `flags` fields. Do not paste whole outputs into chat.
 
@@ -41,7 +45,7 @@ All output is JSON. Read the `ok`, `why`, `warnings` and `flags` fields. Do not 
    - Manual positions (owner `manual`): never close, resize or change leverage. They count toward the caps and block that pair.
 2. **Refresh the scan** if `scan.json` is older than `entry.max_scan_age_min` (35 min): `scan.py`.
 3. **News is enforced by the script.** You do not pre-filter. `execute.py` runs the news gate and, when `macro_window.enabled` is true, the macro window on every candidate and skips blocked ones with a reason.
-4. **Open at most one trade.** Run `execute.py`. It re-checks freshness, side geometry, net R:R, ATR, trend, news gate, macro window, size, leverage fit and liquidation, and moves to the next setup if one fails. If `why` says `ORDER OUTCOME UNKNOWN`, check the exchange for that client order id before anything else, run `manage.py status`, and report it. If the result is `ok: true` with `warnings`, fix what the warning says (usually `manage.py ensure-stops`) and report it.
+4. **Open at most one trade.** Run `execute.py`. It re-checks freshness, stock-perp block, side geometry, net R:R, ATR, 4H trend, 1H trend, news gate, macro window, size, leverage fit and liquidation, and moves to the next setup if one fails. If `why` says `ORDER OUTCOME UNKNOWN`, check the exchange for that client order id before anything else, run `manage.py status`, and report it. If the result is `ok: true` with `warnings`, fix what the warning says (usually `manage.py ensure-stops`) and report it.
 5. **Log the run** in `state.json`: time, result, reason, positions opened/closed/adjusted, equity. For each new entry record the news rating and `scanner_flag` (that pair's flags whose `candle_close_time` is within the last 2 closed 15m candles, else `[]`). Flags never decide anything.
 
 ## Messages

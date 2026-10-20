@@ -23,6 +23,7 @@ Crontab (`crontab -e`). `CRON_TZ` support varies; the times below assume the sys
 ```cron
 # Shadow swap logger: plain script, no LLM
 9,24,39,54 * * * *  /path/to/perp-desk/run.sh python3 scripts/shadow_swap.py --once >> data/cron.log 2>&1
+*/5 * * * *         /path/to/perp-desk/run.sh python3 scripts/shadow_variants.py --once >> data/cron.log 2>&1
 
 # Optional standalone alerts scanner (only if the Executor does NOT run it as step 0)
 # 0,30 * * * *  /path/to/perp-desk/run.sh python3 scripts/scanner.py >> data/cron.log 2>&1

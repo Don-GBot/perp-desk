@@ -56,6 +56,8 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Fresh scan | `scan.json` no older than `max_scan_age_min` (35). |
 | Stop vs ATR | Stop distance ≥ `min_stop_atr` (1) × ATR14 on 1H. The order script allows `atr_tolerance` (0.95) for drift. |
 | Trend | With the 4H trend: EMA20 > EMA50 and close > EMA50 for longs, mirror for shorts. Flat pairs are skipped. Re-checked at order time. |
+| 1H trend gate | `entry.trend_1h` (on): longs only in a 1H uptrend, shorts only in a 1H downtrend (EMA20/EMA50 + close vs EMA50 on 200 closed 1H candles, `scripts/trend1h.py`). Flat blocks both. A data error skips the setup (fails closed). Logged as `1h_trend`. |
+| Stock perps | `entry.stock_perp_block` (on): no new entries on stock perps (equities, ETFs, index perps, tokenized stocks): the maintained list in `scripts/stockperp.py` OR exchange assetClass Stocks/Indices. Checked first; unreadable metadata for an unlisted pair skips (fails closed). Open positions are never touched. Logged as `stock_perp`. |
 | Equity | Skip if equity can't be read. |
 | Caps | `max_open` (4) overall, `max_per_direction` (4) per side, checked right before the order. Manual positions count. |
 | No duplicates | No new trade on a pair with any position. |
@@ -119,6 +121,15 @@ Either way, manual positions block bot entries on that pair and count toward the
 ### Logging
 Every run, open position and closed trade goes in `state.json`. Each new entry records its news rating and `scanner_flag` (that pair's flags within the last 2 closed 15m candles, or `[]`).
 
+Script-written logs (logging only; none of them changes a stop, order or close):
+| Log | Written by | Content |
+|---|---|---|
+| `blocked_setups.jsonl` | `execute.py` (and `blocklog.py add` for the agent) | One line per news-gate, 1h-trend or stock-perp block: pair, side, levels, rating, gate_reason, asset_class. `--dry` runs go to `logs/blocked_setups_dry.jsonl` instead. |
+| `runs.json` | `manage.py` | One run record per invocation (run_id in the output). The agent adds its own fields with `runlog.py annotate`, never by hand. |
+| `closed_trades.jsonl` | `manage.py` | One line per closed bot position, matched to the exchange positions history by positionId, else createTime within 120 s (one history row per record). |
+| funding fields | `manage.py` | `funding_paid` / `funding_n` on open bot records and closed-trade lines (exchange funding-fee bills, read-only). |
+| `transfers.json` | `transfers.py` | Owner deposits and withdrawals, so equity changes are not read as PnL. `detect --since` lists futures-account transfers from the exchange bills (read-only). |
+
 ---
 
 ## 3. Shadow swap logger (`scripts/shadow_swap.py`)
@@ -133,6 +144,16 @@ Read only. No LLM. Runs from plain cron.
 | Margin | The candidate must fit the margin rules after freeing the old trade's margin. |
 | Output | One JSON record per decision plus a SUMMARY per cycle. |
 | Go-live | Only after the Manager's weekly go/no-go and the owner's approval. |
+
+---
+
+## 3b. Shadow filter variants (`scripts/shadow_variants.py`)
+
+Read only. No LLM. Runs from plain cron or as its own loop. Every new `scan.json` is walked by several virtual books
+with different filters (BASELINE = live rules, BASELINE_NO1H, V_1H, V_ATR15, V_RR10, STOCKS_ONLY, V_SLOWTREND, V_CROWD;
+see `config.example.yaml` -> `shadow_variants`). Each book keeps its own caps and tracks its entries to TP / SL / BE /
+trail / hard cut on 1m bars. `--stats` grades the CLOSE rows per book. A variant goes live only after the Manager's review
+and the owner's approval, as a config change.
 
 ---
 

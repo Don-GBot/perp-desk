@@ -70,6 +70,22 @@ entry:
     ema_slow: 50
   # execute.py refuses scan.json older than this many minutes. Refresh the scan first.
   max_scan_age_min: 35
+  # 1H trend gate (scripts/trend1h.py), checked again at order time: longs only in a 1H uptrend,
+  # shorts only in a 1H downtrend, flat blocks both. Up = EMA fast > EMA slow and close > EMA slow on the
+  # last `bars` closed 1H candles; down = mirror. A data error skips the setup (fails closed).
+  trend_1h:
+    enabled: true
+    bar: 1H
+    bars: 200
+    ema_fast: 20
+    ema_slow: 50
+  # Stock-perp block (scripts/stockperp.py): no new entries on stock perps (equities, ETFs, index perps,
+  # tokenized stocks). A pair is a stock perp if it is on the maintained list or Blofin reports assetClass
+  # Stocks or Indices, so new listings are caught. Commodities and crypto are not blocked by this gate.
+  # If the instrument metadata cannot be read for an unlisted pair, the setup is skipped (fails closed).
+  # Open positions are never touched.
+  stock_perp_block:
+    enabled: true
 
 # ---------------------------------------------------------------------------
 # Setup scanner (scripts/scan.py)
@@ -169,3 +185,34 @@ shadow_swap:
   rr_edge: 0.5               # and candidate R:R must beat old R:R + this
   max_age_min: 60            # ignore scan setups older than this
   slots: [9, 24, 39, 54]     # minutes past the hour for the built-in scheduler
+
+# ---------------------------------------------------------------------------
+# Logging only (never changes a stop, order or close)
+# ---------------------------------------------------------------------------
+logging:
+  # One JSON line per gate block (news, 1h trend, stock perp) in data/blocked_setups.jsonl.
+  # --dry runs write to data/logs/blocked_setups_dry.jsonl instead, so they never mix with live lines.
+  blocked_setups: true
+  # manage.py records funding paid per bot position (GET /api/v1/account/funding-fees, read-only).
+  funding: true
+  # manage.py appends one run record per invocation to data/runs.jsonl (run_id printed in its output);
+  # the agent attaches its own fields with scripts/runlog.py annotate.
+  run_records: true
+
+# ---------------------------------------------------------------------------
+# Shadow filter variants (scripts/shadow_variants.py, read-only, never trades)
+# ---------------------------------------------------------------------------
+# Each new scan.json is walked by several virtual books with different filters, so rule changes can be
+# compared on the same setups before they go live. Books: BASELINE (live rules), BASELINE_NO1H (live
+# rules without the 1h gate), V_1H (1h gate always on), V_ATR15 (stop widened to >= atr_widen x ATR),
+# V_RR10 (skip setups with R:R >= rr_cap), STOCKS_ONLY (stock perps only), V_SLOWTREND (time-series
+# momentum z over 168h/720h must agree with the side, |z| > slowtrend_z_min), V_CROWD (no longs in the
+# crowd_n pairs with the highest average funding over crowd_hours, no shorts in the crowd_n lowest).
+shadow_variants:
+  enabled: true
+  poll_sec: 20
+  rr_cap: 10
+  atr_widen: 1.5
+  slowtrend_z_min: 1.0
+  crowd_n: 2
+  crowd_hours: 72

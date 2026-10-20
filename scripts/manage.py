@@ -13,7 +13,11 @@
 Output is one JSON object. Exit code 0 if the result is ok, 1 otherwise (2 for bad arguments).
 Every action that changes something holds DATA_DIR/execute.lock (shared with execute.py).
 Every exchange response is checked at the top level and in data.code.
-Each run first prunes DATA_DIR/bot_positions.json of records that match no open position.
+Each run first prunes DATA_DIR/bot_positions.json of records that match no open position. Pruned records are looked up
+in the positions history and logged to DATA_DIR/closed_trades.jsonl (closes.py: positionId first, else createTime within
+120 s, one history row per record). Logging only, never an order:
+  - funding.py writes funding_paid / funding_n on open bot records each run (logging.funding) and on closed-trade lines;
+  - runlog.py appends one run record per invocation to DATA_DIR/runs.json (logging.run_records); its run_id is in the output.
 
 Bot vs manual positions: a position is the bot's if
   (a) a bot_positions.json record MATCHES it (same pair and side, and the position's createTime equals
@@ -38,7 +42,7 @@ import os, sys, json, argparse
 from decimal import ROUND_DOWN, ROUND_UP
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
-import config, lock, registry
+import config, lock, registry, closes, funding, runlog
 import execute as EX
 from scan import candles, atr
 
@@ -326,6 +330,38 @@ def status(reg=None):
 def exit_code(res):
     return 0 if isinstance(res, dict) and res.get('ok') else 1
 
+LG = C["logging"]
+
+def bookkeeping(removed, reg):
+    """Closed-trade lines + funding + nothing else. Never raises; returns a dict for the output."""
+    out = dict(closes=[], funding_errors=[], errors=[])
+    try:
+        lines, errs = closes.record(removed, _get, funding_get=_get if LG['funding'] else None)
+        out['closes'] = [dict(instId=x['instId'], positionId=x.get('positionId'), realized_pnl=x.get('realized_pnl')) for x in lines]
+        out['errors'] += errs
+    except Exception as e: out['errors'].append(f'close log failed: {str(e)[:160]}')
+    if LG['funding'] and reg:
+        n, errs = funding.update(reg, _get); out['funding_errors'] = errs
+        if n:
+            try:
+                cur = registry.load()
+                for k, v in reg.items():
+                    if k in cur: cur[k].update({f: v[f] for f in ('funding_paid', 'funding_n', 'funding_bills', 'funding_ts') if f in v})
+                registry.save(cur)
+            except Exception as e: out['funding_errors'].append(f'funding save failed: {str(e)[:160]}')
+    return out
+
+def log_run(cmd, res, book):
+    if not LG['run_records']: return None
+    rid = runlog.new_run_id()
+    try:
+        runlog.append(dict(ts_utc=runlog.now_z(), run_id=rid, source=runlog.SOURCE, cmd=cmd, ok=bool(res.get('ok')),
+                           pruned_records=res.get('pruned_records'), closes=book.get('closes'),
+                           funding_errors=book.get('funding_errors'), errors=book.get('errors')))
+        return rid
+    except Exception as e:
+        res.setdefault('warnings', []).append(f'run record not written: {str(e)[:160]}'); return None
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('cmd', choices=['status', 'ensure-stops', 'hard-cut', 'breakeven', 'tighten', 'close', 'cancel-tpsl', 'cancel-trail'])
@@ -339,15 +375,17 @@ def main():
         print(f'{a.cmd} needs an instId, e.g. BTC-USDT', file=sys.stderr); sys.exit(2)
     if a.cmd == 'tighten' and a.price is None:
         print('tighten needs a price: manage.py tighten BTC-USDT 80000', file=sys.stderr); sys.exit(2)
+    book = {}
     try:
         if a.cmd == 'status':
             try:
-                with lock.exclusive(): reg, pruned = registry.prune(positions())
+                with lock.exclusive():
+                    reg, removed = registry.prune_full(positions()); pruned = sorted(removed); book = bookkeeping(removed, reg)
             except lock.LockBusy: reg, pruned = registry.load(), []
             res = status(reg); res['pruned_records'] = pruned
         else:
             with lock.exclusive():
-                reg, pruned = registry.prune(positions())
+                reg, removed = registry.prune_full(positions()); pruned = sorted(removed); book = bookkeeping(removed, reg)
                 actions = {
                     'ensure-stops': lambda: ensure_stops(reg),
                     'hard-cut': lambda: hard_cut(reg),
@@ -360,6 +398,9 @@ def main():
                 res = actions[a.cmd](); res['pruned_records'] = pruned
     except lock.LockBusy as e: res = dict(ok=False, why=str(e))
     except Exception as e: res = dict(ok=False, why=f'error: {str(e)[:300]}')
+    if book: res['bookkeeping'] = book
+    rid = log_run(a.cmd, res, book)
+    if rid: res['run_id'] = rid
     print(json.dumps(res, indent=1, default=str))
     sys.exit(exit_code(res))
 

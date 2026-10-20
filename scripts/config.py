@@ -24,7 +24,9 @@ DEFAULTS = {
     "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True},
     "entry": {"min_rr": 3, "min_stop_atr": 1, "atr_tolerance": 0.95,
               "trend_filter": {"enabled": True, "timeframe": "4H", "ema_fast": 20, "ema_slow": 50},
-              "max_scan_age_min": 35},
+              "max_scan_age_min": 35,
+              "trend_1h": {"enabled": True, "bar": "1H", "bars": 200, "ema_fast": 20, "ema_slow": 50},
+              "stock_perp_block": {"enabled": True}},
     "scan": {"universe_size": 25, "max_spread_pct": 0.1, "swing_lookback_1h": 12, "swing_buffer_atr": 0.25,
              "target_lookback_4h": 60, "atr_period": 14, "candles_limit": 200},
     "leverage": {"min": 3, "max": 20, "margin_cap_pct": 25, "free_margin_buffer": 0.95,
@@ -37,6 +39,9 @@ DEFAULTS = {
     "scanner": {"move_alert_pct": 5, "realert_min_pts": 3, "realert_frac": 0.25, "memory_hours": 24,
                 "coil_ratio": 0.5, "coil_top": 3, "flag_min_quote_vol_usd": 1000000, "flag_bar": "15m"},
     "shadow_swap": {"hurdle_mult": 1.2, "rr_edge": 0.5, "max_age_min": 60, "slots": [9, 24, 39, 54]},
+    "logging": {"blocked_setups": True, "funding": True, "run_records": True},
+    "shadow_variants": {"enabled": True, "poll_sec": 20, "rr_cap": 10, "atr_widen": 1.5, "slowtrend_z_min": 1.0,
+                        "crowd_n": 2, "crowd_hours": 72},
 }
 
 # ---- minimal YAML subset parser -----------------------------------------------------------------
@@ -148,6 +153,16 @@ def validate(cfg):
     _bool(cfg, "bot.protect_manual_trades")
     _num(cfg, "entry.min_rr", 0, lo_incl=False); _num(cfg, "entry.min_stop_atr", 0)
     _num(cfg, "entry.atr_tolerance", 0, 1, lo_incl=False); _num(cfg, "entry.max_scan_age_min", 0, lo_incl=False)
+    _bool(cfg, "entry.trend_1h.enabled"); _bool(cfg, "entry.stock_perp_block.enabled")
+    t1 = cfg["entry"]["trend_1h"]
+    a1 = _num(cfg, "entry.trend_1h.ema_fast", 1, integer=True); b1 = _num(cfg, "entry.trend_1h.ema_slow", 1, integer=True)
+    if a1 >= b1: raise ConfigError("entry.trend_1h.ema_fast must be smaller than ema_slow")
+    if _num(cfg, "entry.trend_1h.bars", 1, 1440, integer=True) < b1: raise ConfigError("entry.trend_1h.bars must be >= ema_slow")
+    if t1["bar"] not in ("15m", "30m", "1H", "2H", "4H"): raise ConfigError(f"entry.trend_1h.bar not supported: {t1['bar']!r}")
+    for k in ("blocked_setups", "funding", "run_records"): _bool(cfg, "logging." + k)
+    _bool(cfg, "shadow_variants.enabled"); _num(cfg, "shadow_variants.poll_sec", 1); _num(cfg, "shadow_variants.rr_cap", 0, lo_incl=False)
+    _num(cfg, "shadow_variants.atr_widen", 0, lo_incl=False); _num(cfg, "shadow_variants.slowtrend_z_min", 0)
+    _num(cfg, "shadow_variants.crowd_n", 1, integer=True); _num(cfg, "shadow_variants.crowd_hours", 1)
     tf = cfg["entry"]["trend_filter"]
     _bool(cfg, "entry.trend_filter.enabled")
     f = _num(cfg, "entry.trend_filter.ema_fast", 1, integer=True); s = _num(cfg, "entry.trend_filter.ema_slow", 1, integer=True)

@@ -203,7 +203,10 @@ class TestExecuteValidation(NoNetwork):
     def test_non_crypto_rejected(self):
         ins = {"BTC-USDT": dict(INS["BTC-USDT"], assetClass="Stocks")}
         plan, why = EX.evaluate(dict(instId="BTC-USDT", side="buy", stop=101500, target=113000), dict(self.ctx, ins=ins))
-        self.assertIsNone(plan); self.assertIn("not a crypto perp", why)
+        self.assertIsNone(plan); self.assertIn("stock_perp", why)          # stock-perp block fires first
+        ins = {"BTC-USDT": dict(INS["BTC-USDT"], assetClass="Commodities")}
+        plan, why = EX.evaluate(dict(instId="BTC-USDT", side="buy", stop=101500, target=113000), dict(self.ctx, ins=ins))
+        self.assertIsNone(plan); self.assertIn("not a crypto perp", why)  # the crypto-only check still applies
 
     def test_news_blocked_candidate_skipped_in_evaluate(self):
         with mock.patch.object(EX.news_gate, "check", return_value=dict(block=True, reason="fresh bearish rating, high confidence")), \

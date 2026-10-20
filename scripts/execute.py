@@ -3,6 +3,7 @@
 
   python3 scripts/execute.py                 # try setups in scan.json, best R:R first
   python3 scripts/execute.py --inst SOL-USDT # only this pair's setup
+  python3 scripts/execute.py --dry           # run every check, print the plan, place nothing
 
 Needs BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE. Holds DATA_DIR/execute.lock while running.
 
@@ -12,7 +13,9 @@ Per run:
   - For each setup in order (best R:R first), skip it with a reason if any check fails, then try the next:
     side valid; direction cap; no position on the pair; stop/target rounded to tick and
     stop < entry < target (long) or target < entry < stop (short) at the live price;
+    not a stock perp (entry.stock_perp_block, stockperp.py; checked first, fails closed);
     net R:R (after round-trip taker fees) >= min_rr; stop >= ATR floor; 4H trend re-checked now;
+    1H trend aligned with the side (entry.trend_1h, trend1h.py; flat blocks both sides, a data error skips);
     size >= instrument min; a leverage in [min, max] that fits the margin cap; liquidation well beyond the stop.
   - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop.
 Sizing: a clean stop-out loses about risk_per_trade_pct of equity INCLUDING entry and exit taker fees.
@@ -25,6 +28,9 @@ The news gate (news_gate.check) and, when enabled, the macro window (news_gate.m
 applied inside evaluate() to every candidate, so falling through to the next setup can never open a
 news-blocked trade.
 
+Every news-gate, 1h-trend and stock-perp block is logged to DATA_DIR/blocked_setups.jsonl (blocklog.py, source
+"execute"); --dry lines go to DATA_DIR/logs/blocked_setups_dry.jsonl. A log failure only adds a warning.
+
 If the order request times out or the connection drops, the script looks the order up by its
 clientOrderId (and checks positions) before deciding it failed.
 """
@@ -33,6 +39,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
 import config, lock, registry, news_gate
+import trend1h as T1, stockperp as SP, blocklog as BL
 
 def _load_json(path):
     with open(path) as fh:
@@ -49,6 +56,7 @@ MAX_AGE_MIN = float(E["max_scan_age_min"])
 NEW_MM = LV["margin_mode"]
 LEVMIN = int(LV["min"]); LEVMAX = int(LV["max"]); MARGIN_CAP = LV["margin_cap_pct"] / 100.0
 FREE_BUF = float(LV["free_margin_buffer"]); MMR_DEFAULT = float(LV["mmr_default"]); MAX_STOP_TO_LIQ = float(LV["max_stop_to_liq"])
+TREND1H = T1.ENABLED; STOCKPERP = bool(E["stock_perp_block"]["enabled"])
 SIDES = {'buy': 'buy', 'long': 'buy', 'sell': 'sell', 'short': 'sell'}
 
 def fs(x): return format(Decimal(str(x)).normalize(), 'f')
@@ -118,6 +126,36 @@ def pair_positions(inst):
 def instruments():
     return {x['instId']: x for x in bf.public('/api/v1/market/instruments')['data']}
 
+# ---- shared gates (also used by shadow_swap.py / shadow_variants.py) ---------------------------
+def stockperp_check(inst, ins=None):
+    """(reason, detail) if inst is a stock perp or cannot be classified (fail closed), else (None, how). No-op when off."""
+    if not STOCKPERP: return None, None
+    try:
+        stock, how = SP.is_stock(inst, ins) if ins else SP.lookup(inst, bf.public)
+        if inst not in SP.STOCK_PERPS and ins and not ins.get('assetClass'): stock, how = SP.lookup(inst, bf.public)
+    except Exception as e: return 'stock_perp (data error)', str(e)[:160]
+    return (f'stock_perp ({how})', how) if stock else (None, how)
+
+def trend1h_check(inst, side, rows=None):
+    """(reason, detail) if the 1H trend does not agree with side or cannot be read (fail closed), else (None, detail)."""
+    if not TREND1H: return None, None
+    try:
+        t, ef, es, p = T1.trend_from_rows(rows if rows is not None else candles(inst, T1.BAR, T1.BARS))
+    except Exception as e: return '1h_trend (data error)', str(e)[:160]
+    d = dict(trend=t, ema_fast=ef, ema_slow=es, close=p)
+    return (None, d) if t == T1.want(side) else (f'1h_trend ({t})', d)
+
+def log_block(setup, gate_reason, reason, ctx, extra=None):
+    """Append one blocked_setups line. Never raises: a failure becomes a warning in ctx."""
+    if not BL.ENABLED: return
+    try:
+        side = norm_side(setup.get('side'))
+        line = BL.build_line('execute', 'dry' if ctx.get('dry') else 'live', setup.get('instId'), 'long' if side == 'buy' else 'short',
+                             setup.get('entry'), setup.get('stop'), setup.get('target'), setup.get('rr'), setup.get('_rank'),
+                             gate_reason, run_id=os.environ.get('RUN_ID'), scan_ts=ctx.get('scan_ts'), reason=reason, **(extra or {}))
+        BL.append(line)
+    except Exception as e: ctx.setdefault('warnings', []).append(f'blocked_setups log failed: {str(e)[:160]}')
+
 # ---- per-setup evaluation ----------------------------------------------------------------------
 def evaluate(setup, ctx):
     """Returns (plan, None) if this setup can be traded now, else (None, reason)."""
@@ -130,11 +168,17 @@ def evaluate(setup, ctx):
     n_side = sum(1 for p in pos if (float(p['positions']) > 0) == (side == 'buy'))
     if n_side >= MAXDIR: return None, 'direction cap'
     ins = ctx['ins'].get(inst)
+    sw, how = stockperp_check(inst, ins)
+    if sw:
+        log_block(setup, 'stock_perp (data error)' if 'data error' in sw else 'stock_perp', sw, ctx, dict(detail=how))
+        return None, sw
     if not ins: return None, 'instrument not found'
     if ins.get('state') not in (None, 'live') or ins.get('offTime'): return None, 'instrument not live or scheduled for delisting'
     if ins.get('assetClass') != 'Crypto': return None, f'not a crypto perp (assetClass {ins.get("assetClass")!r})'
     ng = news_gate.check(inst, side)
-    if ng.get('block'): return None, f'news gate: {ng["reason"]}'
+    if ng.get('block'):
+        log_block(setup, 'news_gate', ng['reason'], ctx)
+        return None, f'news gate: {ng["reason"]}'
     mc = news_gate.macro_check()
     if mc.get('block'): return None, mc['reason']
     tick = ins['tickSize']; lot = ins['lotSize']; cv = float(ins['contractValue']); mins = float(ins['minSize'])
@@ -153,6 +197,10 @@ def evaluate(setup, ctx):
         tr = trend([x[3] for x in candles(inst, tf['timeframe'])])[0]
         want = 'up' if side == 'buy' else 'down'
         if tr != want: return None, f'{tf["timeframe"]} trend now {tr}, need {want}'
+    tw, t1d = trend1h_check(inst, side)
+    if tw:
+        log_block(setup, '1h_trend (data error)' if 'data error' in tw else '1h_trend', tw, ctx, dict(detail=t1d))
+        return None, tw
     equity, avail = ctx['equity'], ctx['avail']
     size = size_for(equity, entry, stop, cv, lot)
     if size < mins: return None, f'size {size:g} below min {mins:g}'
@@ -164,7 +212,7 @@ def evaluate(setup, ctx):
         return None, f'liq {liq:.8g} too close: stop dist {risk:.8g} >= {MAX_STOP_TO_LIQ:g} x liq dist {abs(liq-entry):.8g} at {lev}x'
     if pair_positions(inst): return None, 'existing position on pair; leverage untouched'
     coid = bf.client_order_id(PREFIX)
-    plan = dict(instId=inst, side=side, news=ng, macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr_net=rr,
+    plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr_net=rr,
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
                 stop_dist=risk, fee_rate=FEE, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
                 lev_req=dict(instId=inst, leverage=str(lev), marginMode=NEW_MM, positionSide='net'),
@@ -267,8 +315,8 @@ def place(plan):
     write_json('exec_last.json', out)
     return out
 
-def run(setups, scan_ts, now=None):
-    """Try setups in order; open at most one. Returns a result dict."""
+def run(setups, scan_ts, now=None, dry=False):
+    """Try setups in order; open at most one (none with dry=True: the first passing plan is returned). Returns a result dict."""
     why = check_scan_fresh(scan_ts, now)
     if why: return dict(ok=False, why=why)
     equity, avail, pos, mode = account()
@@ -277,20 +325,24 @@ def run(setups, scan_ts, now=None):
     if not equity > 0: return dict(ok=False, why='equity unreadable')
     if len(pos) >= MAXALL: return dict(ok=False, why='overall cap')
     if mode != 'net_mode': return dict(ok=False, why=f'account position mode {mode} != net_mode')
-    ctx = dict(equity=equity, avail=avail, pos=pos, ins=instruments())
+    ctx = dict(equity=equity, avail=avail, pos=pos, ins=instruments(), dry=dry, scan_ts=scan_ts, warnings=[])
     skipped = []
-    for s in setups:
+    for i, s in enumerate(setups):
+        s = dict(s, _rank=i + 1)
         try: plan, why = evaluate(s, ctx)
         except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
         if plan is None: skipped.append(dict(instId=s.get('instId'), why=why)); continue
+        if dry: return dict(ok=True, dry=True, plan=plan, skipped=skipped, warnings=ctx['warnings'])
         out = place(plan); out['skipped'] = skipped
+        if ctx['warnings']: out.setdefault('warnings', []).extend(ctx['warnings'])
         if out.get('ok') or out.get('order_resp') is not None: return out   # accepted, rejected or unknown: stop here
         skipped.append(dict(instId=s.get('instId'), why=out.get('why'))); continue  # leverage refused: try next
-    return dict(ok=False, why='no setup passed the checks', skipped=skipped)
+    return dict(ok=False, why='no setup passed the checks', skipped=skipped, warnings=ctx['warnings'], **(dict(dry=True) if dry else {}))
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--inst', help='only consider this instId from scan.json')
+    ap.add_argument('--dry', action='store_true', help='run every check and print the plan; place nothing (still needs read keys)')
     a = ap.parse_args()
     bf.require_keys('execute.py')
     try:
@@ -298,10 +350,10 @@ if __name__ == '__main__':
         setups = scan.get('setups') or []
         if a.inst: setups = [s for s in setups if s.get('instId') == a.inst]
         with lock.exclusive():
-            res = run(setups, scan.get('ts')) if setups else dict(ok=False, why='no matching setup in scan.json')
+            res = run(setups, scan.get('ts'), dry=a.dry) if setups else dict(ok=False, why='no matching setup in scan.json')
     except lock.LockBusy as e: res = dict(ok=False, why=str(e))
     except FileNotFoundError: res = dict(ok=False, why='scan.json not found; run scan.py first')
     except Exception as e: res = dict(ok=False, why=f'error: {str(e)[:300]}')
     res['finished_at'] = now_utc().isoformat()
-    write_json('exec_last.json', res)
+    if not a.dry: write_json('exec_last.json', res)   # a dry run never overwrites the live result
     print(json.dumps(res, indent=1, default=str))

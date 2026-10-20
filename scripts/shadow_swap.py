@@ -34,7 +34,8 @@ run code with __name__ == "__main__"):
   2. stop < entry < target (mirrored for shorts) and net R:R >= min_rr, stop/target rounded to tick
   3. stop distance >= min_stop_atr * atr_tolerance * 1H ATR
   4. 4H trend aligned (scan.py rule)
-  5. size >= minSize and a margin fit (leverage range, margin cap incl. margin freed by closing the
+  5. not a stock perp (entry.stock_perp_block) and 1H trend aligned (entry.trend_1h), same functions as execute.py
+  6. size >= minSize and a margin fit (leverage range, margin cap incl. margin freed by closing the
      old trade, liquidation well beyond the stop).
   Failures are logged once per cycle as FILTERED. Margin fit is re-checked per pair.
 """
@@ -151,6 +152,12 @@ def entry_filters(c, ins, tk, equity, risk_usdt, now_dt):
     elif not flt["rr_ok"]: flt["failed"].append("RR"); why.append(f"net R:R {rr:.2f} < {EX.MINRR:g}")
     if not flt["atr_ok"]: flt["failed"].append("ATR"); why.append(f"stop {rd/a1 if a1 else 0:.2f}x 1H ATR < {ATR_MIN}")
     if not flt["trend_ok"]: flt["failed"].append("TREND"); why.append(f"4H trend {tr} != {want}")
+    sw, how = EX.stockperp_check(i, meta)                  # mirrors execute.py entry.stock_perp_block
+    flt.update(stock_perp=how, asset_class=EX.SP.asset_class(i, meta))
+    if sw: flt["failed"].append("STOCK_PERP"); why.append(sw)
+    tw, t1d = EX.trend1h_check(i, eside)                    # mirrors execute.py entry.trend_1h
+    flt["trend1h"] = t1d
+    if tw: flt["failed"].append("TREND1H"); why.append(tw)
     size = EX.size_for(equity, px, stop, cv, lot) if rd > 0 else 0.0
     flt.update(size=size, min_size=mins)
     if size < mins: flt["failed"].append("MINSIZE"); why.append(f"size {size:g} < min {mins:g}")
