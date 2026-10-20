@@ -275,9 +275,13 @@ class TestCooldown(GateBase):
         write_closed([self.L(close_ms=self.nm - 5 * 3_600_000)])
         self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"])                  # after 4h
     def test_kinds_that_do_not_trigger(self):
-        for l in (self.L(realized_pnl=5, kind="tp"), self.L(kind="manual"), self.L(be_done=True),
-                  self.L(close_avg=100.2, be_stop=100.1), self.L(realized_pnl=0)):
+        for l in (self.L(realized_pnl=5, kind="tp"), self.L(kind="manual"), self.L(close_avg=100.2, be_stop=100.1),
+                  self.L(close_avg=100.0, be_stop=100.1),                       # within the 0.18% slippage tolerance
+                  self.L(realized_pnl=-20, equity_at_entry=1000), self.L(realized_pnl=0)):   # 20 < 0.5R (R = 50)
             write_closed([l]); self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], l)
+        for l in (self.L(be_done=True), self.L(be_done=True, close_avg=99.5, be_stop=100.1),   # BE marked, filled far below
+                  self.L(realized_pnl=-30, equity_at_entry=1000)):                                # 30 >= 0.5R
+            write_closed([l]); self.assertTrue(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], l)
         for k in ("stop", "trail", "cut"):
             write_closed([self.L(kind=k)]); self.assertTrue(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], k)
     def test_unreadable_fails_closed(self):
@@ -358,7 +362,7 @@ class TestPendingCooldown(GateBase):
     def test_pending_kinds_and_expiry(self):
         now = dt.datetime.now(dt.timezone.utc)
         for rec, block in ((dict(close_by="cut"), True), (dict(close_by="stop"), True), (dict(close_by="manual"), False),
-                           (dict(be_done=True), False), (dict(pending_since=(now - dt.timedelta(hours=5)).isoformat()), False)):
+                           (dict(be_done=True), True), (dict(pending_since=(now - dt.timedelta(hours=5)).isoformat()), False)):
             registry.save_pending([dict(dict(instId="BTC-USDT", side="buy", pending_since=now.isoformat()), **rec)])
             self.assertEqual(closes.cooldown_check("BTC-USDT", "buy", now)["block"], block, rec)
     def test_close_ms_zero_uses_logged_utc(self):
@@ -428,3 +432,94 @@ class TestScannerImport(NoNetwork):
         if os.path.exists(lockp): os.remove(lockp)
         importlib.import_module("scanner")
         self.assertFalse(os.path.exists(lockp))
+
+
+# ---- second review fixes ----------------------------------------------------------------------------------------
+PLAN = dict(instId="BTC-USDT", side="buy", stop=103500.0, target=110000.0, entry=104000.0, stop_dist=500.0, atr1h=100.0,
+            tick="0.1", equity=1000.0, lev_req={}, order_req=dict(clientOrderId="bfxprov1"))
+
+class TestProvisionalRecord(NoNetwork):
+    def setUp(self): super().setUp(); registry.save({})
+    def tearDown(self): registry.save({}); super().tearDown()
+    def priv(self, order):
+        def priv(method, path, params=None, body=None):
+            if path == "/api/v1/account/set-leverage": return {"code": "0", "data": {"code": "0"}}
+            if path == "/api/v1/trade/order": return order()
+            return {"code": "0", "data": []}
+        return priv
+    def test_unknown_outcome_keeps_provisional_record_and_it_counts(self):
+        def boom(): raise TimeoutError("read timed out")
+        with mock.patch.object(bf, "private", self.priv(boom)), mock.patch.object(EX, "resolve_uncertain_order", return_value=("unknown", [])):
+            r = EX.place(dict(PLAN))
+        self.assertFalse(r["ok"]); self.assertIn("ORDER OUTCOME UNKNOWN", r["why"])
+        rec = registry.load()["BTC-USDT"]
+        self.assertTrue(rec["provisional"]); self.assertEqual(rec["clientOrderId"], "bfxprov1")
+        self.assertEqual(rec["initial_stop"], 103500.0); self.assertEqual(rec["equity_at_entry"], 1000.0)
+        p = dict(instId="BTC-USDT", positions="1", createTime=str(T.now_ms()))   # position shows up later
+        self.assertEqual(registry.match(p)["clientOrderId"], "bfxprov1")         # adopted as the bot's
+        self.assertEqual(EX.bot_side_count("buy", [p]), 1)
+    def test_rejected_drops_record(self):
+        with mock.patch.object(bf, "private", self.priv(lambda: {"code": "1", "msg": "no"})):
+            r = EX.place(dict(PLAN))
+        self.assertFalse(r["ok"]); self.assertNotIn("BTC-USDT", registry.load())
+    def test_put_failure_aborts_before_order(self):
+        sent = []
+        def order(): sent.append(1); return {"code": "0", "data": [{"code": "0"}]}
+        with mock.patch.object(bf, "private", self.priv(order)), mock.patch.object(registry, "put", side_effect=OSError("disk full")):
+            r = EX.place(dict(PLAN))
+        self.assertFalse(r["ok"]); self.assertIn("order NOT sent", r["why"]); self.assertEqual(sent, [])
+
+class TestDirCapHistory(NoNetwork):
+    def test_history_owned_position_counts(self):
+        import manage
+        p = dict(instId="ETH-USDT", positions="1", createTime=str(T.now_ms()))
+        with mock.patch.object(manage, "history_says_bot", return_value=True):
+            self.assertEqual(EX.bot_side_count("buy", [p], {}), 1)
+        with mock.patch.object(manage, "history_says_bot", return_value=False):
+            self.assertEqual(EX.bot_side_count("buy", [p], {}), 0)
+
+class TestHardCutFallback(NoNetwork):
+    def setUp(self):
+        super().setUp()
+        import manage; self.m = manage
+        self.p1 = dict(instId="A-USDT", positions="10", averagePrice="100", markPrice="90", marginMode="isolated", positionSide="net")
+        self.p2 = dict(instId="B-USDT", positions="10", averagePrice="100", markPrice="100", marginMode="isolated", positionSide="net")
+        self.ps = [mock.patch.object(manage, "wallet_balance", return_value=1000.0),
+                   mock.patch.object(manage, "positions", return_value=[self.p1, self.p2]),
+                   mock.patch.object(manage, "owner", return_value=(True, dict(equity_at_entry=1000.0))),
+                   mock.patch.object(manage, "_instrument", return_value=dict(tickSize="0.01", contractValue="1")),
+                   mock.patch.object(manage, "pending_tpsl", return_value=[])]
+        for x in self.ps: x.start()
+    def tearDown(self):
+        for x in self.ps: x.stop()
+        super().tearDown()
+    def test_close_fails_then_tightest_valid_stop(self):
+        stops = []
+        with mock.patch.object(self.m, "close_position", return_value=dict(ok=False, why="exchange 500")), \
+             mock.patch.object(self.m, "replace_stop", side_effect=lambda p, sl, keep_tp=True: stops.append((p["instId"], sl)) or dict(ok=True)):
+            out = self.m.hard_cut()
+        self.assertIn(("A-USDT", 89.99), stops)                         # mark 90 is past the cut: one tick inside the mark
+        self.assertTrue(any(s[0] == "B-USDT" for s in stops))             # second position still handled
+        self.assertTrue(any(e["instId"] == "A-USDT" for e in out["errors"]))
+    def test_close_raises_and_one_error_does_not_skip_rest(self):
+        stops = []
+        def rs(p, sl, keep_tp=True):
+            if p["instId"] == "A-USDT": raise RuntimeError("boom")
+            stops.append(p["instId"]); return dict(ok=True)
+        with mock.patch.object(self.m, "close_position", side_effect=RuntimeError("timeout")), mock.patch.object(self.m, "replace_stop", side_effect=rs):
+            out = self.m.hard_cut()
+        self.assertEqual(stops, ["B-USDT"]); self.assertTrue(any("A-USDT" == e["instId"] for e in out["errors"]))
+
+class TestEnsureStopsManualPriceOnly(NoNetwork):
+    def test_manual_uses_price_only(self):
+        import manage
+        p = dict(instId="M-USDT", positions="10", averagePrice="100", markPrice="100", marginMode="isolated", positionSide="net")
+        seen = {}
+        real = manage.hard_cut_distance
+        def hcd(*a, **k): seen.update(k); return real(*a, **k)
+        with mock.patch.object(manage, "positions", return_value=[p]), mock.patch.object(manage, "pending_tpsl", return_value=[]), \
+             mock.patch.object(manage, "owner", return_value=(False, None)), mock.patch.object(manage, "PROTECT_MANUAL", False), \
+             mock.patch.object(manage, "wallet_balance", return_value=1000.0), mock.patch.object(manage, "_instrument", return_value=dict(tickSize="0.01", contractValue="1")), \
+             mock.patch.object(manage, "hard_cut_distance", side_effect=hcd), mock.patch.object(manage, "place_tpsl", return_value=dict(ok=True)):
+            manage.ensure_stops()
+        self.assertEqual((seen.get("fee"), seen.get("slip")), (0.0, 0.0))

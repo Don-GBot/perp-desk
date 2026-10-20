@@ -17,9 +17,10 @@ Close kind: the record's close_by when manage.py closed it ('cut' = hard cut, 's
 (no close-type field is used), so a LOSING close of unknown cause counts as 'stop' (it starts a cooldown: errs toward
 blocking) and a winning one as 'tp'. A manual close done outside manage.py therefore also counts as a stop if it lost.
 Re-entry cooldown (cooldown_check): a close starts one when realized pnl < 0, kind is stop / trail / cut, and it is not
-a break-even scratch (be_done, or the exit at/beyond the recorded be_stop in the trade's favour). Manual closes don't.
+a break-even scratch (exit at/beyond the recorded be_stop minus a slippage tolerance, or a loss under 0.5R; see
+is_scratch). Manual closes don't.
 Closes not logged yet are covered too: a pending record (closed_pending.json) on the same pair+side blocks unless it is
-a manual close or a break-even scratch, for cooldown_hours from pending_since (fail closed until it is resolved).
+a manual close, for cooldown_hours from pending_since (fail closed until it is resolved).
 A logged line without close_ms uses logged_utc as the close time.
 """
 import os, json, time, fcntl, datetime as dt
@@ -82,12 +83,22 @@ def close_kind(rec, pnl):
     if rec.get('close_by'): return rec['close_by']
     return 'stop' if pnl is not None and pnl < 0 else 'tp'
 
+SCRATCH_R = 0.5   # a loss under 0.5R is a scratch
+
 def is_scratch(c):
-    if c.get('be_done') is True or c.get('kind') == 'be': return True
-    try: ex, bes = float(c.get('close_avg')), float(c.get('be_stop'))
-    except (TypeError, ValueError): return False
-    s = norm_side(c.get('side'))
-    return (ex >= bes) if s == 'long' else (ex <= bes) if s == 'short' else False
+    """Break-even scratch ONLY if the exit is at or beyond be_stop in the trade's favour (minus a slippage tolerance of
+    fees.slip_frac x be_stop), or the loss is under SCRATCH_R x the planned risk (risk_per_trade_pct x equity_at_entry).
+    be_done alone is not enough: a BE that was marked but not filled near the BE stop still counts as a loss."""
+    slip = float(config.CFG['fees']['slip_frac']); s = norm_side(c.get('side'))
+    ex, bes = fnum(c.get('close_avg')), fnum(c.get('be_stop'))
+    if ex is not None and bes:
+        if s == 'long' and ex >= bes * (1 - slip): return True
+        if s == 'short' and ex <= bes * (1 + slip): return True
+    pnl, eq = fnum(c.get('realized_pnl')), fnum(c.get('equity_at_entry'))
+    if pnl is not None and eq:
+        R = eq * config.CFG['risk']['risk_per_trade_pct'] / 100.0
+        if R > 0 and -pnl < SCRATCH_R * R: return True
+    return False
 
 def cooldown_trigger(c):
     """(True, kind) if closed-trade line c starts a re-entry cooldown, else (False, why)."""
@@ -131,7 +142,7 @@ def pending_block(inst, side, now_ms, hours):
     """Reason if a not-yet-logged close on inst+side must block (fail closed), else None."""
     for r in registry.load_pending():
         if r.get('instId') != inst or norm_side(r.get('side')) != side: continue
-        if r.get('close_by') == 'manual' or r.get('be_done') is True: continue
+        if r.get('close_by') == 'manual': continue   # outcome unknown until logged: be_done alone does not exempt it
         since = registry.iso_ms(r.get('pending_since')) or now_ms
         if now_ms < since + int(hours * 3_600_000):
             why = f"close by {r['close_by']}" if r.get('close_by') else 'close not logged yet (outcome unknown)'
@@ -194,6 +205,7 @@ def record(removed, get, now_ms=None, funding_get=None):
                         open_avg=fnum(h.get('openAveragePrice')), close_avg=fnum(h.get('closeAveragePrice')),
                         realized_pnl=fnum(h.get('realizedPnl')), fee=fnum(h.get('fee')), close_ms=int(fnum(h.get('updateTime'), 0) or 0),
                         initial_stop=rec.get('initial_stop'), target=rec.get('target'), be_done=rec.get('be_done'), be_stop=rec.get('be_stop'),
+                        equity_at_entry=rec.get('equity_at_entry'),
                         asset_class=rec.get('asset_class'), logged_utc=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
             line['kind'] = close_kind(rec, line['realized_pnl'])
             if funding_get is not None:

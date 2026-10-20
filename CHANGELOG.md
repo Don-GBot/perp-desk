@@ -44,10 +44,17 @@ Logging (no rule change):
 
 Fixes:
 - Re-entry cooldown also covers closes not logged yet: a pending record on the same pair+side blocks (fail closed)
-  for `cooldown_hours`, unless it was a manual close or a break-even scratch. Closed-trade lines are appended under a
+  for `cooldown_hours`, unless it was a manual close. A break-even scratch now needs the exit at/beyond the BE stop
+  (minus a slippage tolerance) or a loss under 0.5R; `be_done` alone no longer exempts a loss. Closed-trade lines are appended under a
   lock with fsync; a corrupt line is reported by line number. A line without close_ms uses its log time.
-- `execute.py --dry` no longer prunes `bot_positions.json`: a dry run writes nothing in the data folder.
+- `execute.py --dry` no longer prunes `bot_positions.json`: a dry run writes no state/live files (its blocks go only to
+  the dry log).
 - `execute.py` stores the exchange positionId on the bot record, so close matching uses it first.
+- `execute.py` writes a provisional bot record BEFORE the order (no record, no order). It stays when the order outcome
+  is unknown after a timeout, so the position is adopted as the bot's; it is removed when the order is rejected.
+- The direction cap counts a position as the bot's by its record OR a bot-prefixed opening order in the history.
+- `manage.py hard-cut`: if a cut close fails, it falls back to the tightest valid stop; one position's error no longer
+  skips the others. `ensure-stops` uses the price-only distance for manual positions.
 - Shadow books: the hard cut uses equity at entry, and break-even is marked only when the stop actually moves.
 - `scanner.py` takes its run lock inside main(), so importing it has no side effects.
 - Position / close matching: a recorded position createTime now matches within 120 s instead of by exact string, so a

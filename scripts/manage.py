@@ -258,33 +258,55 @@ def loss_at(avg, stop, coin, fee=FEE, slip=SLIP):
 def _cut_basis(rec, wallet):
     return float(rec['equity_at_entry']) if rec and rec.get('equity_at_entry') else wallet
 
+def _fallback_stop(p, hc, tick, mark, long_, out, why):
+    """Close failed: protect with the tightest VALID stop instead (the cut stop, or one tick inside the mark if the cut
+    level is already past it). Tighten only."""
+    try:
+        sl = _stop_of(pending_tpsl(p['instId']))
+        if hc is None or _past(long_, hc, mark):
+            t = float(tick); hc = float(EX.q(mark - t if long_ else mark + t, tick, ROUND_DOWN if long_ else ROUND_UP))
+        if sl is not None and ((long_ and sl >= hc) or (not long_ and sl <= hc)):
+            out['errors'].append(dict(instId=p['instId'], why=f'{why}; existing stop {sl:g} already tighter than {hc:g}')); return
+        r = replace_stop(p, hc, keep_tp=True)
+        (out['tightened'] if r['ok'] else out['errors']).append(dict(instId=p['instId'], old=sl, new=hc, fallback=True, why=f"{why}; {r.get('why') or 'fallback stop placed'}"))
+    except Exception as e: out['errors'].append(dict(instId=p['instId'], why=f'{why}; fallback stop failed: {str(e)[:160]}'))
+
+def _cut_close(p, inst, reg, hc, tick, mark, long_, out, info):
+    try: r = close_position(inst, reg=reg, by='cut')
+    except Exception as e: r = dict(ok=False, why=f'close failed: {str(e)[:160]}')
+    if r.get('ok'): out['closed'].append(dict(info, instId=inst, why=info.get('why'))); return
+    out['errors'].append(dict(info, instId=inst, why=r.get('why')))
+    _fallback_stop(p, hc, tick, mark, long_, out, f"hard-cut close failed ({r.get('why')})")
+
 def hard_cut(reg=None):
     reg = registry.load() if reg is None else reg
     wallet = wallet_balance(); out = dict(wallet_balance=wallet, tightened=[], closed=[], skipped_manual=[], errors=[])
     for p in positions():
-        inst = p['instId']; bot, rec = owner(p, reg)
-        if PROTECT_MANUAL and not bot: out['skipped_manual'].append(inst); continue
-        ins = _instrument(inst); tick = ins['tickSize']; long_ = is_long(p)
-        coin = abs(float(p['positions'])) * float(ins['contractValue'])
-        avg = float(p['averagePrice']); mark = float(p.get('markPrice') or avg)
-        basis = _cut_basis(rec, wallet); limit = HARD_CUT * basis
-        f, sp = (FEE, SLIP) if bot else (0.0, 0.0)   # bot: all in (fees + slippage); manual (protect off): price only
-        open_loss = loss_at(avg, mark, coin, f, sp) if _past(long_, avg, mark) else 0.0   # loss if closed now
-        d = hard_cut_distance(avg, coin, long_, basis, fee=f, slip=sp)
-        if open_loss >= limit or d <= 0:
-            r = close_position(inst, reg=reg, by='cut')
-            (out['closed'] if r['ok'] else out['errors']).append(dict(instId=inst, loss_now=round(open_loss, 4), limit=round(limit, 4), why=r.get('why') or 'HARD CUT BREACHED: closed'))
-            continue
-        hc = float(EX.q(avg - d if long_ else avg + d, tick, ROUND_UP if long_ else ROUND_DOWN))
-        if _past(long_, hc, mark):
-            r = close_position(inst, reg=reg, by='cut')
-            (out['closed'] if r['ok'] else out['errors']).append(dict(instId=inst, hard_cut_stop=hc, mark=mark, why=r.get('why') or 'mark already past the hard-cut stop: closed'))
-            continue
-        sl = _stop_of(pending_tpsl(inst))
-        if sl is None or (long_ and sl < hc) or (not long_ and sl > hc):   # tighten only, never widen
-            r = replace_stop(p, hc, keep_tp=True)
-            (out['tightened'] if r['ok'] else out['errors']).append(dict(instId=inst, old=sl, new=hc, basis=basis, why=r.get('why')))
+        try: _hard_cut_one(p, reg, wallet, out)
+        except Exception as e: out['errors'].append(dict(instId=p.get('instId'), why=f'hard cut error: {str(e)[:200]}'))   # next position still runs
     return _ok(out)
+
+def _hard_cut_one(p, reg, wallet, out):
+    inst = p['instId']; bot, rec = owner(p, reg)
+    if PROTECT_MANUAL and not bot: out['skipped_manual'].append(inst); return
+    ins = _instrument(inst); tick = ins['tickSize']; long_ = is_long(p)
+    coin = abs(float(p['positions'])) * float(ins['contractValue'])
+    avg = float(p['averagePrice']); mark = float(p.get('markPrice') or avg)
+    basis = _cut_basis(rec, wallet); limit = HARD_CUT * basis
+    f, sp = (FEE, SLIP) if bot else (0.0, 0.0)   # bot: all in (fees + slippage); manual (protect off): price only
+    open_loss = loss_at(avg, mark, coin, f, sp) if _past(long_, avg, mark) else 0.0   # loss if closed now
+    d = hard_cut_distance(avg, coin, long_, basis, fee=f, slip=sp)
+    hc = float(EX.q(avg - d if long_ else avg + d, tick, ROUND_UP if long_ else ROUND_DOWN)) if d > 0 else None
+    if open_loss >= limit or d <= 0:
+        _cut_close(p, inst, reg, hc, tick, mark, long_, out, dict(loss_now=round(open_loss, 4), limit=round(limit, 4), why='HARD CUT BREACHED: closed'))
+        return
+    if _past(long_, hc, mark):
+        _cut_close(p, inst, reg, hc, tick, mark, long_, out, dict(hard_cut_stop=hc, mark=mark, why='mark already past the hard-cut stop: closed'))
+        return
+    sl = _stop_of(pending_tpsl(inst))
+    if sl is None or (long_ and sl < hc) or (not long_ and sl > hc):   # tighten only, never widen
+        r = replace_stop(p, hc, keep_tp=True)
+        (out['tightened'] if r['ok'] else out['errors']).append(dict(instId=inst, old=sl, new=hc, basis=basis, why=r.get('why')))
 
 def ensure_stops(reg=None):
     reg = registry.load() if reg is None else reg
@@ -298,7 +320,8 @@ def ensure_stops(reg=None):
         ins = _instrument(inst); tick = ins['tickSize']; long_ = is_long(p)
         coin = abs(float(p['positions'])) * float(ins['contractValue']); avg = float(p['averagePrice'])
         mark = float(p.get('markPrice') or avg)
-        d = hard_cut_distance(avg, coin, long_, _cut_basis(rec, wallet))
+        f, sp = (FEE, SLIP) if bot else (0.0, 0.0)   # manual (protect off): price-only, as the RULEBOOK says
+        d = hard_cut_distance(avg, coin, long_, _cut_basis(rec, wallet), fee=f, slip=sp)
         hc = avg - d if long_ else avg + d
         init = rec.get('initial_stop') if rec else None          # only from a matching record
         cand = [x for x in (init, hc) if x is not None]

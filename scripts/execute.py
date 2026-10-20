@@ -173,9 +173,11 @@ def cooldown_block(inst, side, now=None):
     return cd['reason'] if cd['block'] else None
 
 def bot_side_count(side, pos, reg=None):
-    """Open BOT positions on side ('buy'/'sell'): exchange positions with a matching bot_positions.json record."""
+    """Open BOT positions on side ('buy'/'sell'): a matching bot_positions.json record OR, as manage.py decides
+    ownership, a bot-prefixed opening order in the exchange history (manage.history_says_bot)."""
+    import manage   # lazy: manage imports this module
     reg = registry.load_strict() if reg is None else reg
-    return sum(1 for p in pos if (float(p['positions']) > 0) == (side == 'buy') and registry.match(p, reg))
+    return sum(1 for p in pos if (float(p['positions']) > 0) == (side == 'buy') and (registry.match(p, reg) or manage.history_says_bot(p)))
 
 def dircap_block(side, pos):
     try: n = bot_side_count(side, pos)
@@ -294,11 +296,24 @@ def place(plan):
     inst = plan['instId']; side = plan['side']
     lr = bf.private('POST', '/api/v1/account/set-leverage', body=plan['lev_req'])
     if not bf.resp_ok(lr): return dict(ok=False, why=f'set-leverage failed: {bf.resp_err(lr)}', plan=plan)
+    # Provisional bot record BEFORE the order: if the outcome is lost, the next match/prune still adopts the position as
+    # the bot's and it counts toward the direction cap. No record, no order.
+    rec = dict(instId=inst, side=side, clientOrderId=plan['order_req']['clientOrderId'], opened_at=now_utc().isoformat(),
+               entry_quote=plan['entry'], initial_stop=plan['stop'], target=plan['target'], stop_dist=plan['stop_dist'],
+               atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False, asset_class=plan.get('asset_class'), provisional=True)
+    try: registry.put(rec)
+    except Exception as e: return dict(ok=False, why=f'bot_positions.json not writable ({str(e)[:120]}); order NOT sent', plan=plan)
+    def _drop():
+        try:
+            rg = registry.load()
+            if rg.get(inst, {}).get('clientOrderId') == rec['clientOrderId']: rg.pop(inst); registry.save(rg)
+        except Exception: pass
     try:
         r = bf.private('POST', '/api/v1/trade/order', body=plan['order_req'])
-        if not bf.resp_ok(r): return dict(ok=False, why=f'order rejected: {bf.resp_err(r)}', plan=plan, order_resp=r)
+        if not bf.resp_ok(r): _drop(); return dict(ok=False, why=f'order rejected: {bf.resp_err(r)}', plan=plan, order_resp=r)
     except Exception as e:
         state, ev = resolve_uncertain_order(plan)
+        if state == 'rejected': _drop()   # 'unknown' keeps the provisional record (fail toward "bot position")
         if state != 'accepted':
             res = dict(ok=False, plan=plan, order_resp=dict(error=str(e)[:300], resolution=state, evidence=ev),
                        why=(f'order request failed ({str(e)[:120]}); order not found on the exchange' if state == 'rejected' else
@@ -309,9 +324,7 @@ def place(plan):
     out = dict(ok=True, accepted_at=now_utc().isoformat(), plan=plan, order_resp=r, warnings=[])
     if isinstance(r, dict) and r.get('recovered'): out['warnings'].append('order response was lost; acceptance confirmed by order lookup')
     write_json('exec_last.json', out)
-    rec = dict(instId=inst, side=side, clientOrderId=plan['order_req']['clientOrderId'], opened_at=out['accepted_at'],
-               entry_quote=plan['entry'], initial_stop=plan['stop'], target=plan['target'], stop_dist=plan['stop_dist'],
-               atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False, asset_class=plan.get('asset_class'))
+    rec.pop('provisional', None)
     try: registry.put(rec)
     except Exception as e: out['warnings'].append(f'bot_positions.json not updated: {e}')
     p = []

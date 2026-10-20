@@ -60,7 +60,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Stock perps | `entry.stock_perp_block` (on): no new entries on stock perps (equities, ETFs, index perps, tokenized stocks): the maintained list in `scripts/stockperp.py` OR exchange assetClass Stocks/Indices. Checked first; unreadable metadata for an unlisted pair skips (fails closed). Open positions are never touched. Logged as `stock_perp`. |
 | Equity | Skip if equity can't be read. |
 | Caps | `max_open` (4) overall, all positions incl. manual. `max_per_direction` (3): open BOT positions per side; manual positions don't count. Entry-only, never closes anything. If the bot positions can't be read, the entry is skipped. |
-| Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (BE already moved, or exit at/beyond the BE stop), manual positions and manual closes don't trigger it. A read error skips the entry. |
+| Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (exit at/beyond the BE stop minus a slippage tolerance, or a loss under 0.5R), manual positions and manual closes don't trigger it. A read error skips the entry. |
 | No duplicates | No new trade on a pair with any position. |
 | One per run | At most one new open per run. If the best setup fails a check, the next one is tried. |
 | Position mode | Account must be in net (one-way) mode. |
