@@ -9,7 +9,8 @@ Rules (all values from config.yaml -> scan / entry / fees):
   - Trend: 4H EMA fast/slow. Up = fast > slow and close > slow. Down = mirror. Flat pairs are skipped.
   - Long: entry = ask. Stop = lower of (lowest low of last N 1H candles - buffer x ATR) and
     (entry - min_stop_atr x ATR). Target = highest high of the last M 4H candles. Short is the mirror.
-  - R:R is net of round-trip taker fees (see net_rr). Keep setups with net R:R >= min_rr, best first.
+  - R:R is price-only (gross, see rr): (target - entry) / (entry - stop), mirrored for shorts. Keep setups with
+    R:R >= min_rr, best first. Fees are covered by sizing (risk incl. fees + slippage), not by the R:R filter.
 
 Writes DATA_DIR/scan.json (atomic) and prints it.
   python3 scripts/scan.py
@@ -48,6 +49,11 @@ def trend(closes):
     e1 = ema(closes, tf["ema_fast"])[-1]; e2 = ema(closes, tf["ema_slow"])[-1]; p = closes[-1]
     t = 'up' if (e1 > e2 and p > e2) else 'down' if (e1 < e2 and p < e2) else 'flat'
     return t, e1, e2, p
+
+def rr(side, entry, stop, target):
+    """Price-only reward:risk, the min_rr filter: (target - entry) / (entry - stop) for longs, mirrored for shorts."""
+    risk = (entry - stop) if side == 'buy' else (stop - entry); reward = (target - entry) if side == 'buy' else (entry - target)
+    return reward / risk if risk > 0 else 0.0
 
 def net_rr(side, entry, stop, target, fee=FEE):
     """Reward:risk after round-trip taker fees (entry fee + exit fee at target or stop)."""
@@ -109,11 +115,11 @@ def scan():
             stop = max(swing + buf * a1, entry + k_atr * a1)
             target = min(x[2] for x in h4[-ntg:])
             risk = stop - entry; side = 'sell'
-        rr = net_rr(side, entry, stop, target)
+        r_ = rr(side, entry, stop, target)
         s = dict(instId=inst, side=side, trend4h=tr, entry=entry, stop=stop, target=target, atr1h=a1,
-                 stop_atr=risk / a1 if a1 else None, rr=round(rr, 2), vol_usd=round(qv), spread=spread)
-        if rr >= min_rr: setups.append(s)
-        else: notes.append(f'{inst}: {side} net R:R {rr:.2f} <{min_rr:g}')
+                 stop_atr=risk / a1 if a1 else None, rr=round(r_, 2), rr_net=round(net_rr(side, entry, stop, target), 2), vol_usd=round(qv), spread=spread)
+        if r_ >= min_rr: setups.append(s)
+        else: notes.append(f'{inst}: {side} R:R {r_:.2f} <{min_rr:g}')
     setups.sort(key=lambda s: -s['rr'])
     return dict(ts=dt.datetime.now(dt.timezone.utc).isoformat(), fee_rate=FEE, universe=[r[1] for r in liquid],
                 setups=setups, rejected=notes)

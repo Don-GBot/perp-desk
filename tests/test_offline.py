@@ -124,6 +124,7 @@ class TestExecuteValidation(NoNetwork):
                         mock.patch.object(EX, "candles", fake_candles_up)]
         for p in self.patches: p.start()
         self.ctx = dict(equity=1000.0, avail=1000.0, pos=[], ins=INS)
+        registry.save_pending([])
         self.fresh = dt.datetime.now(dt.timezone.utc).isoformat()
     def tearDown(self):
         for p in self.patches: p.stop()
@@ -174,13 +175,16 @@ class TestExecuteValidation(NoNetwork):
         self.assertIsNone(why, why)
         self.assertLessEqual(plan["est_loss_at_stop"], 1000 * EX.RISK + 1e-9)   # loss incl. fees <= 5% of equity
         self.assertGreater(plan["est_loss_at_stop"], 1000 * EX.RISK * 0.95)
-        self.assertGreaterEqual(plan["rr_net"], EX.MINRR)
+        self.assertGreaterEqual(plan["rr"], EX.MINRR); self.assertLess(plan["rr_net"], plan["rr"])
         self.assertTrue(plan["order_req"]["clientOrderId"].startswith(config.CFG["bot"]["client_order_prefix"]))
 
-    def test_net_rr_lower_than_gross(self):
-        from scan import net_rr
-        gross = (110000 - 104000) / (104000 - 103500)
-        self.assertLess(net_rr("buy", 104000, 103500, 110000), gross)
+    def test_min_rr_is_price_only(self):
+        from scan import net_rr, rr
+        self.assertEqual(rr("buy", 104000, 103500, 110000), 12.0); self.assertEqual(rr("sell", 100, 101, 97), 3.0)
+        self.assertLess(net_rr("buy", 104000, 103500, 110000), 12.0)   # informational only
+        # gross 3.0 passes even though net of fees it is below 3
+        plan, why = EX.evaluate(dict(instId="BTC-USDT", side="buy", stop=101000, target=113000), self.ctx)
+        self.assertIsNotNone(plan, why); self.assertEqual(plan["rr"], 3.0); self.assertLess(plan["rr_net"], 3.0)
 
     def test_accepted_order_is_ok_even_if_later_steps_fail(self):
         posts = []
@@ -200,7 +204,7 @@ class TestExecuteValidation(NoNetwork):
         self.assertTrue(any("TP/SL check failed" in w for w in r["warnings"]))
         self.assertTrue(os.path.exists(config.data_path("exec_last.json")))
 
-    def test_non_crypto_rejected(self):
+    def test_stock_blocked_commodity_allowed(self):
         ins = {"BTC-USDT": dict(INS["BTC-USDT"], assetClass="Stocks")}
         plan, why = EX.evaluate(dict(instId="BTC-USDT", side="buy", stop=101500, target=113000), dict(self.ctx, ins=ins))
         self.assertIsNone(plan); self.assertIn("stock_perp", why)          # stock-perp block fires first

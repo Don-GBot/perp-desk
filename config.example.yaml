@@ -46,8 +46,8 @@ fees:
   taker_rate: 0.0006
   # Slippage buffer as a fraction of entry (0.0018 = 0.18%), added to the loss at the stop in sizing and in
   # the hard cut: loss per coin = |entry - stop| + taker_rate x (entry + stop) + slip_frac x entry.
-  # 0.0018 was the 90th percentile of adverse stop-fill slippage seen live. Outliers beyond it are left
-  # to the hard cut, which cannot catch slippage inside the exchange's own stop fill.
+  # A buffer, not a cap: a worse stop fill can still lose more, and the hard cut cannot catch slippage
+  # inside the exchange's own stop fill. Measure your own fills and adjust.
   slip_frac: 0.0018
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,9 @@ bot:
 # Entry filters
 # ---------------------------------------------------------------------------
 entry:
-  # Minimum reward:risk at the live price (ask for longs, bid for shorts), net of round-trip fees.
+  # Minimum reward:risk at the live price (ask for longs, bid for shorts), price-only:
+  # (target - entry) / (entry - stop), mirrored for shorts. Fees are NOT deducted here; sizing already
+  # puts fees and slippage inside risk_per_trade_pct. A net-of-fees filter blocks wide-target trades.
   min_rr: 3
   # Stop distance must be at least this many 1H ATR(14).
   min_stop_atr: 1
@@ -209,7 +211,7 @@ logging:
   blocked_setups: true
   # manage.py records funding paid per bot position (GET /api/v1/account/funding-fees, read-only).
   funding: true
-  # manage.py appends one run record per invocation to data/runs.jsonl (run_id printed in its output);
+  # manage.py appends one run record per invocation to data/runs.json (run_id printed in its output);
   # the agent attaches its own fields with scripts/runlog.py annotate.
   run_records: true
 

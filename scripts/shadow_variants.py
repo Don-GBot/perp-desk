@@ -35,7 +35,7 @@ import blofin_client as bf
 import config, news_gate as NG
 import execute as EX
 import trend1h as T1, stockperp as SP, slowcrowd as SCW
-from scan import candles, atr, trend, net_rr
+from scan import candles, atr, trend, rr as price_rr
 
 SV = config.CFG["shadow_variants"]; M = config.CFG["management"]
 RR_CAP = float(SV["rr_cap"]); ATR_WIDEN = float(SV["atr_widen"]); Z_MIN = float(SV["slowtrend_z_min"])
@@ -168,9 +168,9 @@ def evaluate(v, s, book, mk, equity, scan_ts, now):
         stop = float(EX.q(ns, tick, ROUND_DOWN if side == 'buy' else ROUND_UP)); pl['widened'] = True
     why = EX.check_geometry(side, entry, stop, target)
     if why: return 'SKIP', why, pl
-    risk = abs(entry - stop); rr = net_rr(side, entry, stop, target)
+    risk = abs(entry - stop); rr = price_rr(side, entry, stop, target)
     pl.update(entry=entry, stop=stop, target=target, rr=round(rr, 4), atr1h=a1, tick=tick)
-    if rr < EX.MINRR: return 'SKIP', f'net R:R {rr:.2f} < {EX.MINRR:g}', pl
+    if rr < EX.MINRR: return 'SKIP', f'R:R {rr:.2f} < {EX.MINRR:g}', pl
     if v == 'V_RR10' and rr >= RR_CAP: return 'SKIP', f'rr>={RR_CAP:g} (R:R {rr:.2f})', pl
     if risk < EX.ATR_FLOOR * a1: return 'SKIP', f'stop {risk/a1:.2f}x ATR too tight', pl
     tf = config.CFG['entry']['trend_filter']
@@ -184,14 +184,14 @@ def evaluate(v, s, book, mk, equity, scan_ts, now):
     if lev is None: return 'SKIP', 'no leverage fits the margin cap', pl
     liq = EX.est_liq(entry, side, lev, float(ins.get('maintenanceMarginRate') or EX.MMR_DEFAULT))
     if risk >= EX.MAX_STOP_TO_LIQ * abs(liq - entry): return 'SKIP', f'liq too close at {lev}x', pl
-    pl.update(coins=size * cv, lev=lev, margin=notional / lev, notional=notional)
+    pl.update(coins=size * cv, lev=lev, margin=notional / lev, notional=notional, equity=equity)
     return 'TAKE', 'passes every check', pl
 
 def open_pos(v, s, rank, pl, scan_ts, now):
     lg = s['side'] in ('buy', 'long'); e = pl['entry']; d = abs(e - pl['stop'])
     return dict(variant=v, inst=s['instId'], side='buy' if lg else 'sell', rank=rank, scan_ts=scan_ts, entry=e, sl=pl['stop'], stop0=pl['stop'],
                 target=pl['target'], coins=pl['coins'], margin=pl['margin'], tick=pl['tick'], d=d, t_entry=ms(now), cursor=ms(now),
-                last_manage=ms(now), be=False, best=e, trig=e + M['breakeven_at_r'] * d if lg else e - M['breakeven_at_r'] * d,
+                last_manage=ms(now), equity_at_entry=pl.get('equity'), be=False, best=e, trig=e + M['breakeven_at_r'] * d if lg else e - M['breakeven_at_r'] * d,
                 act=e + M['trail_activate_r'] * d if lg else e - M['trail_activate_r'] * d,
                 cb=float(EX.q(M['trail_callback_atr'] * pl['atr1h'], pl['tick'])), trail_on=False, tbest=None,
                 asset_class=pl.get('asset_class'), widened=pl.get('widened'))
@@ -212,16 +212,16 @@ def step_bars(pos, bars):
     return None
 
 def manage_step(pos, last, equity, a1_now, now_ms):
-    """manage.py at a 15-min step: fee-inclusive hard cut, then break-even (stop to entry +/- buffer, trail to N x ATR)."""
-    lg = pos['side'] == 'buy'; e = pos['entry']
-    if pos['coins'] * (((e - last) if lg else (last - e)) + EX.FEE * (e + last) + EX.SLIP * e) >= HARD_CUT * equity: return last, 'cut', now_ms
+    """manage.py at a 15-min step: all-in hard cut on equity AT ENTRY (as manage.py), then break-even (stop to entry +/-
+    round-trip fees, trail to N x ATR). be is set only when the stop actually moves."""
+    lg = pos['side'] == 'buy'; e = pos['entry']; basis = pos.get('equity_at_entry') or equity
+    if pos['coins'] * (((e - last) if lg else (last - e)) + EX.FEE * (e + last) + EX.SLIP * e) >= HARD_CUT * basis: return last, 'cut', now_ms
     if not pos['be'] and ((lg and pos['best'] >= pos['trig']) or (not lg and pos['best'] <= pos['trig'])):
         b = M['breakeven_fee_legs'] * EX.FEE
         bes = float(EX.q(e * (1 + b), pos['tick'], ROUND_UP)) if lg else float(EX.q(e * (1 - b), pos['tick'], ROUND_DOWN))
         if (lg and pos['sl'] < bes < last) or (not lg and last < bes < pos['sl']):
             pos['sl'] = bes; pos['cb'] = float(EX.q(M['breakeven_trail_atr'] * a1_now, pos['tick'])) if a1_now else pos['cb']
-            pos['trail_on'] = True; pos['tbest'] = last
-        pos['be'] = True
+            pos['trail_on'] = True; pos['tbest'] = last; pos['be'] = True
     return None
 
 def close_row(pos, fill, kind, t_ms, mk):

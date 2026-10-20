@@ -51,7 +51,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 ### Entry filters
 | Rule | Value |
 |---|---|
-| Minimum R:R | ≥ `min_rr` (3) at the live price (ask for long, bid for short), net of round-trip taker fees (`fees.taker_rate`), stop and target rounded to tick. |
+| Minimum R:R | ≥ `min_rr` (3) at the live price (ask for long, bid for short), price-only: (target − entry) / (entry − stop), mirrored for shorts, stop and target rounded to tick. Fees are not deducted from R:R; sizing covers them. |
 | Side geometry | After rounding: stop < entry < target for longs, target < entry < stop for shorts. |
 | Fresh scan | `scan.json` no older than `max_scan_age_min` (35). |
 | Stop vs ATR | Stop distance ≥ `min_stop_atr` (1) × ATR14 on 1H. The order script allows `atr_tolerance` (0.95) for drift. |
@@ -188,9 +188,7 @@ Audits the bots against logs and this rulebook. See `prompts/manager.md`.
 - **Macro events need a source.** The window ships disabled because no calendar ships with this repo. The news analyst can add events to `fundamentals.json` under `macro.events`, or you can wire a calendar.
 - **Break-even uses the current mark price**, not the best price since entry. A move that reaches the trigger and reverses between runs is missed.
 - **Rating validity equals the news cadence (4h).** A late news run leaves a gap where ratings are not fresh but the gate has not failed open yet. Entries are allowed in that gap.
-- **No re-entry cooldown** after a stop-out.
-- **Slippage and funding are not in R:R or the risk cap** (taker fees are). A stop-out can still lose more than planned.
-- **Per-direction cap equals the overall cap** by default, so it does nothing until you lower it.
+- **Funding is not in R:R or the risk cap** (taker fees and a slippage buffer are). It is logged per position only.
 - **Setup choice:** `execute.py` takes the first (best R:R) setup unless the agent passes `--inst`.
 - **Ownership needs timestamps.** A position the bot opened is recognized by create time (within 120 s of the record or of a bot-prefixed opening order). If the exchange reports a create time far from the order time, the bot treats the position as manual.
 - **Scan freshness (35 min) and shadow candidate age (60 min) differ.**

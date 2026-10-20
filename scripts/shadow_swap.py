@@ -15,7 +15,7 @@ DATA_DIR/logs/shadow_swap.log (human), each rotating at 5 MB x 3. Each cycle end
 
 Assumptions:
  - Fees: taker rate fees.taker_rate per side (config). Closing an open trade costs one
-   taker fee on exit notional. Candidate EV = risk_usdt x net R:R (round-trip fees included).
+   taker fee on exit notional. Candidate EV = risk_usdt x net R:R (round-trip fees included; scan.net_rr).
  - size_coin = |contracts| * contractValue.
  - Remaining profit (old) = |target - mark| * size_coin - exit fee (0 if price is beyond target).
  - Old R:R = remaining reward / remaining distance to stop.
@@ -24,14 +24,14 @@ Assumptions:
  - Break-even rule (old stop at/through entry, R:R undefined):
      PASS iff candEV >= remaining profit * hurdle_mult (R:R rule skipped). Record field rule="BE_EV_ONLY".
  - Price at/through a non-BE stop (risk ~0): not swappable ("old_rr_inf").
- - Candidate R:R is net of round-trip fees (scan.net_rr), ask for longs, bid for shorts.
+ - Candidate R:R is price-only (scan.rr, as execute.py's min_rr filter and the old trade's R:R), ask for longs, bid for shorts.
  - risk_usdt = risk_per_trade_pct of equity (same as execute.py).
 
 Entry filters: a candidate is only scored if it passes the SAME filters as execute.py (helpers
 imported from execute.py / scan.py; importing never triggers a trade because both guard their
 run code with __name__ == "__main__"):
   1. age <= max_age_min (entry ts, else scan.json ts, else file mtime), else FILTERED "STALE"
-  2. stop < entry < target (mirrored for shorts) and net R:R >= min_rr, stop/target rounded to tick
+  2. stop < entry < target (mirrored for shorts) and R:R (price-only) >= min_rr, stop/target rounded to tick
   3. stop distance >= min_stop_atr * atr_tolerance * 1H ATR
   4. 4H trend aligned (scan.py rule)
   5. not a stock perp (entry.stock_perp_block), no re-entry cooldown, 1H trend aligned (entry.trend_1h), same functions as execute.py
@@ -49,7 +49,7 @@ def _load_json(path):
     with open(path) as fh:
         return json.load(fh)
 import execute as EX          # safe: execute.py only acts under __main__; we use pure helpers only
-from scan import candles, atr, trend, net_rr
+from scan import candles, atr, trend, rr as price_rr, net_rr
 
 SC = config.CFG["shadow_swap"]
 D = config.DATA_DIR; L = config.data_path("logs")
@@ -141,7 +141,8 @@ def entry_filters(c, ins, tk, equity, risk_usdt, now_dt):
     stop = float(EX.q(c["stop"], tick)); target = float(EX.q(c["target"], tick))
     rd = sgn * (px - stop); rw = sgn * (target - px)
     geo = EX.check_geometry(eside, px, stop, target)
-    rr = net_rr(eside, px, stop, target) if not geo else 0.0
+    rr = price_rr(eside, px, stop, target) if not geo else 0.0
+    rr_n = net_rr(eside, px, stop, target) if not geo else 0.0
     a1 = atr(candles(i, "1H")); tr, e20, e50, p4 = trend4h(i)
     want = "up" if side == "long" else "down"
     flt.update(live=px, stop_r=stop, target_r=target, rr_live=round(rr, 3), rr_ok=rr >= EX.MINRR,
@@ -149,7 +150,7 @@ def entry_filters(c, ins, tk, equity, risk_usdt, now_dt):
                trend4h=tr, trend_need=want, trend_ok=tr == want, ema20_4h=e20, ema50_4h=e50, close_4h=p4)
     why = []
     if geo: flt["failed"].append("GEOMETRY"); why.append(geo)
-    elif not flt["rr_ok"]: flt["failed"].append("RR"); why.append(f"net R:R {rr:.2f} < {EX.MINRR:g}")
+    elif not flt["rr_ok"]: flt["failed"].append("RR"); why.append(f"R:R {rr:.2f} < {EX.MINRR:g}")
     if not flt["atr_ok"]: flt["failed"].append("ATR"); why.append(f"stop {rd/a1 if a1 else 0:.2f}x 1H ATR < {ATR_MIN}")
     if not flt["trend_ok"]: flt["failed"].append("TREND"); why.append(f"4H trend {tr} != {want}")
     sw, how = EX.stockperp_check(i, meta)                  # mirrors execute.py entry.stock_perp_block
@@ -164,7 +165,7 @@ def entry_filters(c, ins, tk, equity, risk_usdt, now_dt):
     flt.update(size=size, min_size=mins)
     if size < mins: flt["failed"].append("MINSIZE"); why.append(f"size {size:g} < min {mins:g}")
     notional = risk_usdt / rd * px if rd > 0 else 0.0
-    ev = risk_usdt * rr   # net R:R already includes round-trip taker fees
+    ev = risk_usdt * rr_n   # EV uses net R:R (round-trip taker fees included)
     cd = dict(base, live=px, stop=stop, target=target, rr_live=round(rr, 3), ev=round(ev, 4), open_fee=round(notional * FEE, 4),
               _entry=px, _eside=eside, _risk=rd, _notional=size * cv * px, _size=size,
               _maxlev=f(meta.get("maxLeverage")) or EX.LEVMAX, _mmr=f(meta.get("maintenanceMarginRate")) or EX.MMR_DEFAULT)

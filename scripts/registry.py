@@ -80,7 +80,8 @@ def prune_full(positions, reg=None):
     removed = {k: v for k, v in reg.items() if k not in keep}
     if removed:
         pend = load_pending(); have = {(x.get("instId"), x.get("clientOrderId"), x.get("opened_at")) for x in pend}
-        pend += [v for v in removed.values() if (v.get("instId"), v.get("clientOrderId"), v.get("opened_at")) not in have]
+        since = dt.datetime.now(dt.timezone.utc).isoformat()
+        pend += [dict(v, pending_since=since) for v in removed.values() if (v.get("instId"), v.get("clientOrderId"), v.get("opened_at")) not in have]
         save_pending(pend); save(keep)
     return keep, removed
 

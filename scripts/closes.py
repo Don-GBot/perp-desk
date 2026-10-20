@@ -13,11 +13,16 @@ Matching a positions-history row to a bot_positions.json record (close_fit):
 Pruned records wait in closed_pending.json (registry.py) until their row is found (kept up to PENDING_MAX_H hours).
 
 Close kind: the record's close_by when manage.py closed it ('cut' = hard cut, 'stop' = mark already past the stop,
-'manual' = close command), else from the result: a loss = 'stop' (exchange stop-loss or trailing stop), else 'tp'.
+'manual' = close command). Otherwise the exchange closed it, and the positions-history row is not relied on to say why
+(no close-type field is used), so a LOSING close of unknown cause counts as 'stop' (it starts a cooldown: errs toward
+blocking) and a winning one as 'tp'. A manual close done outside manage.py therefore also counts as a stop if it lost.
 Re-entry cooldown (cooldown_check): a close starts one when realized pnl < 0, kind is stop / trail / cut, and it is not
 a break-even scratch (be_done, or the exit at/beyond the recorded be_stop in the trade's favour). Manual closes don't.
+Closes not logged yet are covered too: a pending record (closed_pending.json) on the same pair+side blocks unless it is
+a manual close or a break-even scratch, for cooldown_hours from pending_since (fail closed until it is resolved).
+A logged line without close_ms uses logged_utc as the close time.
 """
-import os, json, datetime as dt
+import os, json, time, fcntl, datetime as dt
 import config, registry
 
 PATH = '/api/v1/account/positions-history'
@@ -94,22 +99,56 @@ def cooldown_trigger(c):
     return True, c['kind']
 
 def load_closed(path=None):
+    """All closed-trade lines. A corrupt line raises ValueError naming its line number (callers fail closed)."""
     out = []
     try: fh = open(path or config.data_path(FILE))
     except FileNotFoundError: return out
     with fh:
-        for x in fh:
+        for n, x in enumerate(fh, 1):
             x = x.strip()
-            if x: out.append(json.loads(x))   # a corrupt line raises: callers skip the entry (fail closed)
+            if not x: continue
+            try: out.append(json.loads(x))
+            except ValueError as e: raise ValueError(f'{FILE} line {n} is corrupt: {e}') from None
     return out
+
+def append_line(line, path=None, wait=2.0):
+    """Append one JSON line under <file>.lock with fsync (same pattern as blocklog.append). Raises on failure."""
+    path = path or config.data_path(FILE)
+    lfd = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        t0 = time.time()
+        while True:
+            try: fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except BlockingIOError:
+                if time.time() - t0 > wait: raise TimeoutError(f'{FILE} lock busy')
+                time.sleep(0.05)
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        try: os.write(fd, (json.dumps(line, default=str) + '\n').encode()); os.fsync(fd)
+        finally: os.close(fd)
+    finally: os.close(lfd)
+
+def pending_block(inst, side, now_ms, hours):
+    """Reason if a not-yet-logged close on inst+side must block (fail closed), else None."""
+    for r in registry.load_pending():
+        if r.get('instId') != inst or norm_side(r.get('side')) != side: continue
+        if r.get('close_by') == 'manual' or r.get('be_done') is True: continue
+        since = registry.iso_ms(r.get('pending_since')) or now_ms
+        if now_ms < since + int(hours * 3_600_000):
+            why = f"close by {r['close_by']}" if r.get('close_by') else 'close not logged yet (outcome unknown)'
+            return f"cooldown: pending {why}, blocked until {dt.datetime.fromtimestamp((since + hours * 3_600_000) / 1000, dt.timezone.utc):%H:%M}Z"
+    return None
 
 def cooldown_check(inst, side, now=None, hours=4, path=None):
     """dict(block, until, reason). No closed_trades.jsonl -> allowed. Unreadable -> raises."""
     s = norm_side(side)
     if s is None: raise ValueError(f'invalid side {side!r}')
     now_ms = int((now or dt.datetime.now(dt.timezone.utc)).timestamp() * 1000); best = None
+    pb = pending_block(inst, s, now_ms, hours)
+    if pb: return dict(block=True, until=None, reason=pb)
     for c in load_closed(path):
-        if c.get('instId') != inst or norm_side(c.get('side')) != s or not c.get('close_ms'): continue
+        if c.get('instId') != inst or norm_side(c.get('side')) != s: continue
+        c = dict(c, close_ms=c.get('close_ms') or registry.iso_ms(c.get('logged_utc')))
+        if not c['close_ms']: continue
         ok, kind = cooldown_trigger(c)
         if not ok: continue
         until = int(c['close_ms']) + int(hours * 3_600_000)
@@ -163,7 +202,6 @@ def record(removed, get, now_ms=None, funding_get=None):
                     funding.apply(line, inst, funding_get, line['close_ms'] or now_ms, final=True, t0=funding.open_ms(rec))
                 except Exception as e: errs.append(f'funding {inst} (close): {str(e)[:160]}')
             try:
-                with open(config.data_path(FILE), 'a') as fh: fh.write(json.dumps(line, default=str) + '\n')
-                lines.append(line)
+                append_line(line); lines.append(line)
             except Exception as e: errs.append(f'close {inst}: write failed: {str(e)[:160]}')
     return lines, errs

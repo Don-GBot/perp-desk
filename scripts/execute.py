@@ -14,7 +14,7 @@ Per run:
     side valid; direction cap; no position on the pair; stop/target rounded to tick and
     stop < entry < target (long) or target < entry < stop (short) at the live price;
     not a stock perp (entry.stock_perp_block, stockperp.py; checked first, fails closed);
-    net R:R (after round-trip taker fees) >= min_rr; stop >= ATR floor; 4H trend re-checked now;
+    R:R (price-only: (target - entry) / (entry - stop)) >= min_rr; stop >= ATR floor; 4H trend re-checked now;
     1H trend aligned with the side (entry.trend_1h, trend1h.py; flat blocks both sides, a data error skips);
     size >= instrument min; a leverage in [min, max] that fits the margin cap; liquidation well beyond the stop.
   - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop.
@@ -48,7 +48,7 @@ import trend1h as T1, stockperp as SP, blocklog as BL, closes
 def _load_json(path):
     with open(path) as fh:
         return json.load(fh)
-from scan import candles, atr, trend, net_rr
+from scan import candles, atr, trend, rr as price_rr, net_rr
 
 C = config.CFG; R_ = C["risk"]; E = C["entry"]; LV = C["leverage"]; M = C["management"]
 RISK = R_["risk_per_trade_pct"] / 100.0
@@ -215,8 +215,8 @@ def evaluate(setup, ctx):
     why = check_geometry(side, entry, stop, target)
     if why: return None, why
     risk = abs(entry - stop)
-    rr = net_rr(side, entry, stop, target)
-    if rr < MINRR: return None, f'net R:R {rr:.2f} < {MINRR:g}'
+    rr = price_rr(side, entry, stop, target)
+    if rr < MINRR: return None, f'R:R {rr:.2f} < {MINRR:g}'
     a1 = atr(candles(inst, '1H'))
     if risk < ATR_FLOOR * a1: return None, f'stop {risk/a1:.2f}x ATR < {E["min_stop_atr"]:g}'
     tf = E['trend_filter']
@@ -240,7 +240,7 @@ def evaluate(setup, ctx):
     live = pair_positions(inst)
     if live: return None, 'existing position on pair; leverage untouched'
     coid = bf.client_order_id(PREFIX)
-    plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr_net=rr,
+    plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr=rr, rr_net=net_rr(side, entry, stop, target),
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
                 stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
                 lev_req=dict(instId=inst, leverage=str(lev), marginMode=NEW_MM, positionSide='net'),
@@ -323,7 +323,8 @@ def place(plan):
     if p:
         try:
             avg = float(p[0]['averagePrice']); out['avg'] = avg; out['liq'] = p[0].get('liquidationPrice')
-            rec.update(avg=avg, stop_dist=abs(avg - plan['stop']), position_createTime=p[0].get('createTime')); registry.put(rec)
+            rec.update(avg=avg, stop_dist=abs(avg - plan['stop']), position_createTime=p[0].get('createTime'),
+                       positionId=p[0].get('positionId')); registry.put(rec)   # positionId: closes.py matches on it first
             Rd = abs(avg - plan['stop']) * M['trail_activate_r']
             act = float(q(avg + Rd if side == 'buy' else avg - Rd, plan['tick']))
             cb = float(q(M['trail_callback_atr'] * plan['atr1h'], plan['tick']))
@@ -348,8 +349,9 @@ def run(setups, scan_ts, now=None, dry=False):
     why = check_scan_fresh(scan_ts, now)
     if why: return dict(ok=False, why=why)
     equity, avail, pos, mode = account()
-    try: registry.prune(pos)
-    except Exception: pass
+    if not dry:   # a dry run never writes bot_positions.json / closed_pending.json
+        try: registry.prune(pos)
+        except Exception: pass
     if not equity > 0: return dict(ok=False, why='equity unreadable')
     if len(pos) >= MAXALL: return dict(ok=False, why='overall cap')
     if mode != 'net_mode': return dict(ok=False, why=f'account position mode {mode} != net_mode')

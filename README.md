@@ -23,7 +23,7 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 
 ## How the pieces fit
 
-1. `scripts/scan.py` ranks the top 25 USDT perps by volume (crypto, commodities, forex; stock perps are blocked later), drops wide spreads, keeps pairs in a 4H trend, and builds setups with R:R ≥ 3 after fees. Output: `data/scan.json`.
+1. `scripts/scan.py` ranks the top 25 USDT perps by volume (crypto, commodities, forex; stock perps are blocked later), drops wide spreads, keeps pairs in a 4H trend, and builds setups with price-only R:R ≥ 3. Output: `data/scan.json`.
 2. `scripts/scanner.py` (optional) writes alerts and info-only flags to `data/flags_latest.json`.
 3. The news analyst rates each pair and writes `data/fundamentals.json`.
 4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, 1H trend gate, stock-perp block, caps), and opens at most one trade with `scripts/execute.py`. Every gate block is logged to `data/blocked_setups.jsonl`; `manage.py` writes run records, closed trades and funding paid.

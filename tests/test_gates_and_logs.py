@@ -25,7 +25,7 @@ SETUP = dict(instId="BTC-USDT", side="buy", stop=101500, target=113000, entry=10
 
 class GateBase(NoNetwork):
     def setUp(self):
-        super().setUp(); clear_logs()
+        super().setUp(); clear_logs(); registry.save_pending([])
         self.fx = FakeExchange(); self.ins = dict(INS)
         self.patches = [mock.patch.object(bf, "public", self.fx.public), mock.patch.object(bf, "private", self.fx.private),
                         mock.patch.object(EX, "candles", fake_candles_up), mock.patch.object(EX, "pair_positions", return_value=[]),
@@ -331,3 +331,100 @@ class TestCommodities(GateBase):
         data = [dict(instId=i, state="live", offTime="", assetClass=c) for i, c in (("A-USDT", "Commodities"), ("B-USDT", "Stocks"), ("C-USDT", "Forex"))]
         with mock.patch.object(bf, "public", return_value=dict(code="0", data=data)):
             self.assertEqual(sorted(scan.tradable_instruments()), ["A-USDT", "B-USDT", "C-USDT"])
+
+# ---- reviewer fixes ---------------------------------------------------------------------------------------------
+import hashlib
+def snapshot(d):
+    out = {}
+    for root, _, files in os.walk(d):
+        for f in files:
+            p = os.path.join(root, f)
+            with open(p, "rb") as fh: out[p] = hashlib.sha256(fh.read()).hexdigest()
+    return out
+
+class TestPendingCooldown(GateBase):
+    def setUp(self):
+        super().setUp(); registry.save({}); registry.save_pending([]); write_closed([])
+        self.fresh = dt.datetime.now(dt.timezone.utc).isoformat()
+    def tearDown(self):
+        registry.save({}); registry.save_pending([]); write_closed([]); super().tearDown()
+    def test_execute_prune_then_same_pair_side_refused(self):
+        registry.save({"BTC-USDT": dict(instId="BTC-USDT", side="buy", opened_at=self.fresh, position_createTime=str(T.now_ms() - 3_600_000))})
+        with mock.patch.object(EX, "place", side_effect=AssertionError("must not place")):
+            r = EX.run([SETUP], self.fresh)          # exchange shows no position -> execute prunes the record
+        self.assertEqual(len(registry.load_pending()), 1); self.assertFalse(r["ok"])
+        self.assertTrue(r["skipped"][0]["why"].startswith("cooldown: pending close not logged yet"), r)
+        self.assertFalse(closes.cooldown_check("BTC-USDT", "sell")["block"])        # other side free
+    def test_pending_kinds_and_expiry(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        for rec, block in ((dict(close_by="cut"), True), (dict(close_by="stop"), True), (dict(close_by="manual"), False),
+                           (dict(be_done=True), False), (dict(pending_since=(now - dt.timedelta(hours=5)).isoformat()), False)):
+            registry.save_pending([dict(dict(instId="BTC-USDT", side="buy", pending_since=now.isoformat()), **rec)])
+            self.assertEqual(closes.cooldown_check("BTC-USDT", "buy", now)["block"], block, rec)
+    def test_close_ms_zero_uses_logged_utc(self):
+        write_closed([dict(instId="BTC-USDT", side="buy", realized_pnl=-1, kind="stop", close_ms=0,
+                           logged_utc=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))])
+        self.assertTrue(closes.cooldown_check("BTC-USDT", "buy")["block"])
+    def test_corrupt_line_number_in_reason(self):
+        with open(config.data_path(closes.FILE), "w") as fh: fh.write(json.dumps(dict(a=1)) + "\n{bad\n")
+        plan, why = EX.evaluate(SETUP, self.ctx)
+        self.assertIsNone(plan); self.assertIn("line 2 is corrupt", why)
+    def test_append_line_locked_fsync(self):
+        closes.append_line(dict(instId="X-USDT")); closes.append_line(dict(instId="Y-USDT"))
+        self.assertEqual([x["instId"] for x in closes.load_closed()], ["X-USDT", "Y-USDT"])
+        self.assertTrue(os.path.exists(config.data_path(closes.FILE) + ".lock"))
+
+class TestDryRunReadOnly(GateBase):
+    def test_dry_leaves_data_byte_identical(self):
+        fresh = dt.datetime.now(dt.timezone.utc).isoformat()
+        registry.save({"OLD-USDT": dict(instId="OLD-USDT", side="buy", opened_at=fresh, position_createTime="1")})   # would be pruned live
+        registry.save_pending([])
+        before = snapshot(T.TMP)
+        r = EX.run([SETUP], fresh, dry=True)
+        self.assertTrue(r["ok"] and r["dry"], r)
+        self.assertEqual(snapshot(T.TMP), before)
+        registry.save({})
+
+class TestPositionIdStored(NoNetwork):
+    def test_place_records_position_id(self):
+        def priv(method, path, params=None, body=None):
+            if method == "POST": return {"code": "0", "data": [{"code": "0"}]} if path == "/api/v1/trade/order" else {"code": "0", "data": {"code": "0"}}
+            if path == "/api/v1/account/positions":
+                return {"code": "0", "data": [dict(instId="BTC-USDT", positions="1", averagePrice="104000", marginMode="isolated",
+                                                    positionSide="net", createTime="123", positionId="777")]}
+            return {"code": "0", "data": []}
+        plan = dict(instId="BTC-USDT", side="buy", stop=103500.0, target=110000.0, entry=104000.0, stop_dist=500.0, atr1h=100.0,
+                    tick="0.1", lev_req={}, order_req=dict(clientOrderId="bfx1"))
+        with mock.patch.object(bf, "private", priv): EX.place(plan)
+        self.assertEqual(registry.load()["BTC-USDT"]["positionId"], "777"); registry.save({})
+
+class TestBreakevenPriority(NoNetwork):
+    def test_recorded_be_stop_wins_over_formula(self):
+        import manage
+        p = dict(averagePrice="100", positions="-1")
+        self.assertEqual(manage.breakeven_price(p, "0.01"), 99.88)
+        self.assertEqual(manage.breakeven_price(p, "0.01", dict(be_stop=99.95)), 99.95)
+        self.assertEqual(manage.breakeven_price(p, "0.01", dict(be_stop=None)), 99.88)
+
+class TestShadowManageStep(NoNetwork):
+    def pos(self, **k):
+        d = dict(side="buy", entry=100.0, sl=98.0, coins=10.0, tick="0.01", be=False, best=102.0, trig=101.5, cb=1.0,
+                 trail_on=False, tbest=None, equity_at_entry=1000.0); d.update(k); return d
+    def test_be_only_when_stop_moves(self):
+        p = self.pos(); SV.manage_step(p, 101.0, 1000.0, 1.0, 0)
+        self.assertTrue(p["be"]); self.assertEqual(p["sl"], 100.12)
+        p = self.pos(sl=100.5); SV.manage_step(p, 101.0, 1000.0, 1.0, 0)        # stop already past BE: not moved
+        self.assertFalse(p["be"]); self.assertEqual(p["sl"], 100.5)
+    def test_hard_cut_uses_equity_at_entry(self):
+        p = self.pos(coins=100.0, best=100.0, equity_at_entry=1000.0)   # loss at 99.6 ~ 70 > 55 (5.5% of 1000)
+        self.assertEqual(SV.manage_step(p, 99.6, 100000.0, 1.0, 5)[1], "cut")
+        p = self.pos(coins=100.0, best=100.0, equity_at_entry=100000.0)
+        self.assertIsNone(SV.manage_step(p, 99.6, 1000.0, 1.0, 5))
+
+class TestScannerImport(NoNetwork):
+    def test_import_has_no_side_effects(self):
+        import importlib
+        lockp = config.data_path("scanner.lock")
+        if os.path.exists(lockp): os.remove(lockp)
+        importlib.import_module("scanner")
+        self.assertFalse(os.path.exists(lockp))
