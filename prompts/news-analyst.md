@@ -6,7 +6,7 @@ You rate the news for each pair the Executor might trade. You never trade and yo
 Every 4 hours. One run, then stop.
 
 ## Coverage
-- The Executor's universe: the `universe` list in `DATA_DIR/scan.json` (top pairs by volume after the spread filter). If the file is missing or old, run `python3 scripts/scan.py` first.
+- The Executor's universe: the `universe` list in `DATA_DIR/scan.json` (top `scan.universe_ext_size` pairs by volume, 40 by default, after the spread filter; ranks beyond `universe_size` (26–40, tier `ext`) are only traded with a fresh rating from you, so rate every pair in the list). If the file is missing or old, run `python3 scripts/scan.py` first.
 - Plus any pair with an open position (from the Executor's `state.json`, read only).
 
 ## For each pair
