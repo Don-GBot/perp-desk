@@ -9,8 +9,10 @@ guard(): refuses inside the freeze windows (ops.freeze_windows, minutes past the
 schedule) and waits until (1) no execute.py / manage.py process is running, dry or live (/proc/*/cmdline), and (2)
 DATA_DIR/execute.lock (execute.py + manage.py) and DATA_DIR/scanner.lock are free (non-blocking flock probe). Polls every
 ops.swap_poll_s (2 s) up to ops.swap_timeout_s (180 s); then SKIP.
-swap(): guard, then HOLDS execute.lock, re-checks for execute/manage processes, and os.replace(src, dst) for each pair
-(src must be staged in the same directory as dst so the replace is atomic). Any doubt -> nothing is swapped.
+swap(): validates every pair first (realpath; src must be staged in the same directory as dst), guard, then HOLDS execute.lock
+and re-checks the freeze window, the scanner lock and execute/manage processes before os.replace(src, dst) per pair.
+Each file is replaced atomically; the set is NOT atomic: a failure mid-set leaves earlier files swapped and is reported
+as partial (exit 3). Freeze windows are minutes past the hour in the box's LOCAL time.
 restart(fn): guard, then calls fn().
 Exit codes: 0 ok, 3 skipped (busy, freeze window, or a staged file problem), 2 bad arguments.
 Linux only (/proc).
@@ -28,7 +30,7 @@ def default_locks():
     return (config.data_path('execute.lock'), config.data_path('scanner.lock'))
 
 def running(proc=None, me=None):
-    """[(pid, cmdline)] for processes whose argv runs execute.py or manage.py (any path, any args, dry or live)."""
+    """[(pid, cmdline)] for processes whose argv runs execute.py or manage.py anywhere in argv (any path, interpreter or wrapper, dry or live)."""
     proc = proc or PROC; me = os.getpid() if me is None else me; out = []
     for d in os.listdir(proc):
         if not d.isdigit() or int(d) == me: continue
@@ -36,7 +38,7 @@ def running(proc=None, me=None):
             with open(os.path.join(proc, d, 'cmdline'), 'rb') as fh: argv = fh.read().split(b'\0')
         except OSError: continue
         argv = [a.decode('utf-8', 'replace') for a in argv if a]
-        if any(os.path.basename(a) in WATCH for a in argv[:3]): out.append((int(d), ' '.join(argv)[:200]))
+        if any(os.path.basename(a) in WATCH for a in argv): out.append((int(d), ' '.join(argv)[:200]))
     return out
 
 def lock_free(path):
@@ -68,20 +70,37 @@ def guard(timeout_s=None, proc=None, locks=None, now=None, sleep=time.sleep, clo
         sleep(POLL_S)
 
 def swap(pairs, timeout_s=None, proc=None, locks=None, now=None, sleep=time.sleep, clock=time.monotonic, hold_lock=None):
+    """Each os.replace is atomic per file; the SET is not: if one replace fails mid-set the earlier ones stay done and the
+    result reports ok=False, partial=True with swapped / failed (exit 3). Everything is validated before the first replace."""
     g = guard(timeout_s, proc, locks, now, sleep, clock)
     if not g['ok']: return dict(g, swapped=[])
-    for src, dst in pairs:
-        if not os.path.exists(src): return dict(g, ok=False, swapped=[], reason=f'staged file missing: {src}')
-        if os.path.dirname(os.path.abspath(src)) != os.path.dirname(os.path.abspath(dst)):
+    rp = [(os.path.realpath(s), os.path.realpath(d)) for s, d in pairs]
+    for (src, dst), (a, b) in zip(pairs, rp):
+        if not os.path.isfile(a): return dict(g, ok=False, swapped=[], reason=f'staged file missing: {src}')
+        if os.path.dirname(a) != os.path.dirname(b):
             return dict(g, ok=False, swapped=[], reason=f'{src} not in the same directory as {dst} (os.replace must be atomic)')
+        if a == b: return dict(g, ok=False, swapped=[], reason=f'{src} and {dst} are the same file')
+        if os.path.isdir(b): return dict(g, ok=False, swapped=[], reason=f'{dst} is a directory')
+        if not os.access(os.path.dirname(b), os.W_OK): return dict(g, ok=False, swapped=[], reason=f'directory of {dst} not writable')
+    if len({b for _, b in rp}) != len(rp): return dict(g, ok=False, swapped=[], reason='same destination twice')
     fd = os.open(hold_lock or config.data_path('execute.lock'), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: return dict(g, ok=False, swapped=[], reason='execute.lock taken between check and swap: SKIP')
+        # recheck everything under the lock: freeze window, scanner lock (and other locks except the one we hold), processes
+        if in_freeze(now() if callable(now) else now): return dict(g, ok=False, swapped=[], reason='entered a freeze window between check and swap: SKIP')
+        held = os.path.realpath(hold_lock or config.data_path('execute.lock'))
+        other = [l for l in (locks if locks is not None else default_locks()) if os.path.realpath(l) != held]
+        bad = [os.path.basename(l) for l in other if not lock_free(l)]
+        if bad: return dict(g, ok=False, swapped=[], busy=[f'lock held: {b}' for b in bad], reason='lock taken between check and swap: SKIP')
         r = running(proc)
         if r: return dict(g, ok=False, swapped=[], busy=[f'pid {p}: {c}' for p, c in r], reason='execute/manage started between check and swap: SKIP')
         done = []
-        for src, dst in pairs: os.replace(src, dst); done.append(dst)
+        for a, b in rp:
+            try: os.replace(a, b); done.append(b)
+            except OSError as x:
+                return dict(g, ok=False, partial=bool(done), swapped=done, failed=b, error=str(x)[:200],
+                            reason=f'replace failed for {b} after {len(done)} of {len(rp)} files: set is PARTIAL, fix by hand')
         return dict(g, swapped=done, at=dt.datetime.now().strftime('%H:%M:%S'))
     finally: os.close(fd)
 

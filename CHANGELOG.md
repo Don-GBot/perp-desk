@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-21 (sync 4, audit fixes)
+
+- Shadow variant stats recompute R from each row's entry/exit/initial_stop with close_row's formula (no double rescale of sync-3 rows); missing fields = `unknown_R`. `R_basis` is set only when R is computed.
+- Scratch rule mirrors live: apart from an exit at/beyond a known BE stop, a scratch requires that BE fired (closes.is_scratch and shadow cooldown_hit; shadow `be_scratch` uses the exact BE stop, as live). A losing stop before BE always starts the cooldown.
+- `scratch_risk` fallbacks are recorded and warned once per close line.
+- `below_min_risk` compares the unrounded risk %; `risk_pct_actual` is rounded for display only.
+- swapguard: validates every pair first (realpath), rechecks the freeze window and scanner lock under execute.lock, reports a mid-set failure as partial (exit 3; each file is atomic, the set is not), matches execute/manage anywhere in argv.
+- RULEBOOK freshness lines updated to 4.5h.
+
 ## 2026-10-21 (sync 4)
 
 - **Minimum risk floor** (`risk.min_risk_pct`, default 1.0): `fit_size` skips an entry as `below_min_risk` (block line logged) when its fee-inclusive risk would be under 1% of equity after scaling. Shadow swap mirrors it through `fit_size`.

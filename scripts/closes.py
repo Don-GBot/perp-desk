@@ -128,6 +128,8 @@ def r_multiples(c):
     if pnl is None: return None, None
     return (round(pnl / ra, 4) if ra else None), (round(pnl / rp, 4) if rp else None)
 
+_FALLBACK_SEEN = set()
+
 def scratch_risk(c):
     """(risk_usdt, basis) for the 0.5R test: 'allin', else 'price_fallback', else 'equity_fallback', else (None, None)."""
     ra = risk_allin(c)
@@ -137,6 +139,9 @@ def scratch_risk(c):
         eq = fnum(c.get('equity_at_entry'))
         rp = eq * config.CFG['risk']['risk_per_trade_pct'] / 100.0 if eq else None; basis = 'equity_fallback'
     if rp:
+        key = (c.get('instId'), c.get('side'), c.get('positionId') or c.get('clientOrderId'), c.get('close_ms'), basis)
+        if key in _FALLBACK_SEEN: return rp, basis   # same line re-checked (cooldown + report): record and warn once
+        _FALLBACK_SEEN.add(key)
         SCRATCH_FALLBACKS.append(dict(instId=c.get('instId'), side=c.get('side'), basis=basis, risk=rp))
         import logging; logging.getLogger('closes').warning(f"be-scratch: fee-inclusive risk not computable for {c.get('instId')} {c.get('side')}; {basis}")
         return rp, basis
@@ -145,9 +150,13 @@ def scratch_risk(c):
 def is_scratch(c):
     """Break-even scratch ONLY if the exit is at or beyond be_stop in the trade's favour (minus a slippage tolerance of
     fees.slip_frac x be_stop), or the loss is under SCRATCH_R x the fee-inclusive planned risk (scratch_risk; logged
-    fallbacks). be_done alone is not enough: a BE that was marked but not filled near the BE stop still counts as a loss."""
+    fallbacks). be_done alone is not enough: a BE that was marked but not filled near the BE stop still counts as a loss. Mirrors the live
+    bot: apart from an exit at/beyond a known be_stop, a scratch REQUIRES that BE fired (be_done or kind 'be')."""
     slip = float(config.CFG['fees']['slip_frac']); s = norm_side(c.get('side'))
-    ex, bes = fnum(c.get('close_avg')), fnum(c.get('be_stop'))
+    ex, b0 = fnum(c.get('close_avg')), fnum(c.get('be_stop'))
+    if ex is not None and b0 and ((s == 'long' and ex >= b0) or (s == 'short' and ex <= b0)): return True   # at/beyond be_stop
+    if not (c.get('be_done') is True or c.get('kind') == 'be'): return False   # BE never fired: a stop-out is not a scratch (as live)
+    bes = b0 or fnum(c.get('current_stop'))
     if ex is not None and bes:
         if s == 'long' and ex >= bes * (1 - slip): return True
         if s == 'short' and ex <= bes * (1 + slip): return True
@@ -266,7 +275,8 @@ def record(removed, get, now_ms=None, funding_get=None):
                         ctVal=rec.get('ctVal'), risk_usdt=rec.get('risk_usdt'), risk_usdt_allin=rec.get('risk_usdt_allin'),
                         asset_class=rec.get('asset_class'), logged_utc=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
             line['kind'] = close_kind(rec, line['realized_pnl'])
-            line['R'], line['R_price'] = r_multiples(line); line['R_basis'] = 'allin'
+            line['R'], line['R_price'] = r_multiples(line)
+            if line['R'] is not None: line['R_basis'] = 'allin'
             if funding_get is not None:
                 try:
                     import funding

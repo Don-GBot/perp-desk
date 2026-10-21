@@ -167,8 +167,9 @@ def fit_size(equity, avail, entry, stop, cv, lot, mins, maxlev=LEVMAX, mmr=MMR_D
         if out['size'] < mins or out['size'] <= 0:
             out.update(gate='below_min_size', why=f"below_min_size: scaled size {out['size']:g} < min {mins:g} (full size {size:g})"); return out
     out['lev'] = L
-    out['risk_pct_actual'] = round(out['size'] * loss_per_contract(entry, stop, cv) / equity * 100, 3) if equity else None
-    if MIN_RISK_PCT > 0 and (out['risk_pct_actual'] is None or out['risk_pct_actual'] < MIN_RISK_PCT):
+    rp = out['size'] * loss_per_contract(entry, stop, cv) / equity * 100 if equity else None   # unrounded: the gate compares this
+    out['risk_pct_actual'] = round(rp, 3) if rp is not None else None                       # rounded for display / logs only
+    if MIN_RISK_PCT > 0 and (rp is None or rp < MIN_RISK_PCT):
         out.update(gate='below_min_risk', why=f"below_min_risk: fee-inclusive risk {out['risk_pct_actual']}% of equity < {MIN_RISK_PCT:g}% "
                                              f"(size {out['size']:g} at {L}x, full size {size:g}, scaled_by {'+'.join(out['scaled_by']) or '-'})")
     return out

@@ -278,8 +278,8 @@ def close_row(pos, fill, kind, t_ms, mk):
     pnl = ((fill - e) if lg else (e - fill)) - EX.FEE * (e + fill) - EX.SLIP * e; rpc = EX.planned_risk_per_coin(e, pos['stop0'])
     row = dict(variant=pos['variant'], decision='CLOSE', scan_ts=pos['scan_ts'], rank=pos['rank'], pair=pos['inst'], side=pos['side'],
                kind=kind, entry=e, exit=fill, initial_stop=pos['stop0'], target=pos['target'], R=round(pnl / rpc, 4) if rpc else None,
-               R_price=round(pnl / abs(e - pos['stop0']), 4) if e != pos['stop0'] else None, R_basis='allin',
-               be_scratch=bool(pos['be'] and ((lg and fill >= pos['sl'] * (1 - EX.SLIP)) or (not lg and fill <= pos['sl'] * (1 + EX.SLIP)))),
+               R_price=round(pnl / abs(e - pos['stop0']), 4) if e != pos['stop0'] else None, **({'R_basis': 'allin'} if rpc else {}),
+               be_scratch=bool(pos['be'] and (fill >= pos['sl'] if lg else fill <= pos['sl'])),   # as live: BE must have fired, exact BE stop, no slip tolerance
                pnl_usdt=round(pnl * pos['coins'], 4), be_done=pos['be'], hold_min=round((t_ms - pos['t_entry']) / 60_000, 1),
                widened=pos.get('widened'), asset_class=pos.get('asset_class') or SP.asset_class(pos['inst']),
                universe_tier=pos.get('universe_tier') or UN.CORE, **({'rr_bucket': pos['rr_bucket']} if pos.get('rr_bucket') else {}))
@@ -288,9 +288,10 @@ def close_row(pos, fill, kind, t_ms, mk):
     return row
 
 def cooldown_hit(row):
-    """Own-book cooldown trigger, mirroring closes.cooldown_trigger / is_scratch: a losing stop / trail / cut / be close,
-    unless it is a scratch: exit at/beyond the BE stop (be_scratch), or BE fired and the loss is under SCRATCH_R in
-    fee-inclusive R. A post-BE close is NOT automatically exempt."""
+    """Own-book cooldown trigger, mirroring the live bot exactly: a losing stop / trail / cut / be close starts the cooldown
+    unless it is a scratch, and a scratch REQUIRES that BE fired: either the exit is at/beyond the BE stop (be_scratch, which
+    is only set when BE fired; exact stop price, no slip tolerance) or BE fired (or kind 'be') and the loss is under
+    closes.SCRATCH_R in fee-inclusive R. A stop-out before BE is never a scratch; a post-BE close is NOT automatically exempt."""
     import closes
     R = row.get('R')
     if R is None or R >= 0 or row.get('kind') not in ('stop', 'trail', 'cut', 'be'): return False
@@ -299,14 +300,16 @@ def cooldown_hit(row):
     return True
 
 def recompute_R(r):
-    """R of a CLOSE row on the fee-inclusive basis: rows without R_basis 'allin' (older versions, R over the loss per coin
-    WITHOUT entry slip) are rescaled: R_allin = R_old x risk_per_coin / planned_risk_per_coin. None if entry/stop unknown."""
-    if r.get('R_basis') == 'allin': return r.get('R')
+    """Fee-inclusive R of a CLOSE row, recomputed from the row's own entry / exit / initial_stop with close_row's formula
+    (pnl/coin = dir*(exit-e) - FEE*(e+exit) - SLIP*e; R = pnl / planned_risk_per_coin), so any older row (whatever basis its
+    stored R used) lands on the same basis without double-rescaling. None (unknown_R) if a field is missing or e == stop."""
     try:
-        e, st = float(r['entry']), float(r['initial_stop'])
-        if r.get('R') is None or e == st: return None
-        return round(float(r['R']) * EX.risk_per_coin(e, st) / EX.planned_risk_per_coin(e, st), 4)
+        e, x, st = float(r['entry']), float(r['exit']), float(r['initial_stop']); lg = r['side'] == 'buy'
     except (KeyError, TypeError, ValueError): return None
+    if e == st: return None
+    pnl = ((x - e) if lg else (e - x)) - EX.FEE * (e + x) - EX.SLIP * e
+    rpc = EX.planned_risk_per_coin(e, st)
+    return round(pnl / rpc, 4) if rpc else None
 
 def pnl_neg(pos, ex):
     e = pos['entry']; fill = ex[0]

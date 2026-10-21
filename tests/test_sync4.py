@@ -73,8 +73,8 @@ class TestBEScratch(NoNetwork):
         self.assertFalse(closes.is_scratch(self.line(realized_pnl=-(0.5 * ra + 0.5))))
         self.assertTrue(closes.cooldown_trigger(self.line(realized_pnl=-(0.5 * ra + 0.5)))[0])
     def test_price_fallback_logged(self):
-        closes.SCRATCH_FALLBACKS.clear()
-        c = dict(instId='A-USDT', side='buy', kind='stop', realized_pnl=-1.0, risk_usdt=20.0)   # no entry/stop: price fallback
+        closes.SCRATCH_FALLBACKS.clear(); closes._FALLBACK_SEEN.clear()
+        c = dict(instId='A-USDT', side='buy', kind='stop', be_done=True, realized_pnl=-1.0, risk_usdt=20.0)   # no entry/stop: price fallback
         self.assertEqual(closes.scratch_risk(c), (20.0, 'price_fallback')); self.assertTrue(closes.is_scratch(c))
         self.assertEqual(closes.SCRATCH_FALLBACKS[-1]['basis'], 'price_fallback')
 
@@ -86,10 +86,49 @@ class TestShadowCooldownAfterBE(NoNetwork):
         self.assertFalse(SV.cooldown_hit(dict(base, R=-0.7, be_scratch=True)))         # exit at the BE stop
         self.assertTrue(SV.cooldown_hit(dict(kind='stop', be_done=False, R=-1.0)))
         self.assertFalse(SV.cooldown_hit(dict(kind='tp', be_done=False, R=-1.0)))
-    def test_old_rows_rescaled(self):
-        r = dict(R=-1.0, entry=100.0, initial_stop=98.0)
-        self.assertAlmostEqual(SV.recompute_R(r), round(-EX.risk_per_coin(100, 98) / EX.planned_risk_per_coin(100, 98), 4))
-        self.assertEqual(SV.recompute_R(dict(R=-1.0, R_basis='allin')), -1.0); self.assertIsNone(SV.recompute_R(dict(R=-1.0)))
+    def test_sync3_row_not_double_rescaled(self):
+        # sync-3 close_row already used planned_risk_per_coin (incl. entry slip) but had no R_basis: R must come out unchanged
+        e, x, st = 100.0, 98.0, 98.0
+        pnl = (x - e) - EX.FEE * (e + x) - EX.SLIP * e; R3 = round(pnl / EX.planned_risk_per_coin(e, st), 4)
+        row = dict(decision='CLOSE', side='buy', kind='stop', entry=e, exit=x, initial_stop=st, R=R3)
+        self.assertEqual(SV.recompute_R(row), R3)
+        short = dict(side='sell', entry=100.0, exit=101.0, initial_stop=102.0, R=123)          # stored R ignored
+        ps = (100 - 101) - EX.FEE * 201 - EX.SLIP * 100
+        self.assertEqual(SV.recompute_R(short), round(ps / EX.planned_risk_per_coin(100, 102), 4))
+    def test_unknown_fields(self):
+        self.assertIsNone(SV.recompute_R(dict(R=-1.0, entry=100.0, initial_stop=98.0, side='buy')))   # no exit
+        self.assertIsNone(SV.recompute_R(dict(R=-1.0, R_basis='allin')))
+    def test_pre_be_stop_never_scratch(self):
+        self.assertTrue(SV.cooldown_hit(dict(kind='stop', be_done=False, be_scratch=False, R=-0.1)))
+
+class TestScratchRequiresBE(NoNetwork):
+    def test_no_be_no_scratch(self):
+        c = dict(instId='A-USDT', side='buy', kind='stop', entry=100.0, initial_stop=98.0, size=10, ctVal=1.0, close_avg=99.9, realized_pnl=-1.0)
+        self.assertFalse(closes.is_scratch(c)); self.assertTrue(closes.cooldown_trigger(c)[0])
+        self.assertTrue(closes.is_scratch(dict(c, be_done=True)))
+    def test_fallback_warned_once_per_line(self):
+        closes.SCRATCH_FALLBACKS.clear(); closes._FALLBACK_SEEN.clear()
+        c = dict(instId='B-USDT', side='buy', kind='stop', be_done=True, realized_pnl=-1.0, risk_usdt=20.0, positionId='p1', close_ms=5)
+        with self.assertLogs('closes', 'WARNING') as lg:
+            for _ in range(3): closes.scratch_risk(c)
+            closes.scratch_risk(dict(c, positionId='p2'))
+        self.assertEqual(len(closes.SCRATCH_FALLBACKS), 2); self.assertEqual(len(lg.output), 2)
+
+class TestMinRiskUnrounded(GateBase):
+    def test_compares_unrounded(self):
+        # 37 contracts x 0.0999996 = 0.36999852% of equity: displays as 0.37, so a 0.37% floor must still block it
+        with mock.patch.object(EX, 'loss_per_contract', return_value=0.0999996), mock.patch.object(EX, 'MIN_RISK_PCT', 0.37):
+            sz = EX.fit_size(1000, 1000, 100.0, 97.0, 1.0, '1', 1.0)
+        self.assertEqual((sz['size'], sz['risk_pct_actual']), (37.0, 0.37)); self.assertEqual(sz['gate'], 'below_min_risk')
+    def test_unscaled_trade_gated(self):
+        with mock.patch.object(EX, 'MIN_RISK_PCT', 5.5):    # an unscaled 5% trade is below a 5.5% floor
+            sz = EX.fit_size(1000, 1000, 100.0, 97.0, 1.0, '0.01', 0.01)
+        self.assertFalse(sz['scaled_down']); self.assertEqual(sz['gate'], 'below_min_risk')
+    def test_margin_scaled_trade(self):
+        sz = EX.fit_size(1000, 30, 100.0, 97.0, 1.0, '0.01', 0.01)   # tiny free margin forces a margin scale-down
+        self.assertEqual(sz['scaled_by'], ['margin']); self.assertIsNone(sz['gate']); self.assertAlmostEqual(sz['risk_pct_actual'], 1.485)
+        with mock.patch.object(EX, 'MIN_RISK_PCT', 1.5):
+            self.assertEqual(EX.fit_size(1000, 30, 100.0, 97.0, 1.0, '0.01', 0.01)['gate'], 'below_min_risk')
 
 class TestSwapGuard(NoNetwork):
     def setUp(self):
@@ -109,12 +148,50 @@ class TestSwapGuard(NoNetwork):
         r = SG.guard(180, self.proc, [], self.ok_time, self.sleep, self.clock)
         self.assertFalse(r['ok']); self.assertGreaterEqual(r['waited_s'], 180); self.assertIn('pid 4242', r['busy'][0])
         self.assertTrue(os.path.exists(os.path.join(self.proc, '4242')))
-    def test_held_lock_blocks(self):
-        lk = os.path.join(self.d, 'execute.lock'); fd = os.open(lk, os.O_CREAT | os.O_RDWR); fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            with mock.patch.object(SG, 'lock_free', return_value=False):   # flock is per-process; simulate another holder
-                self.assertFalse(SG.guard(0, self.proc, [lk], self.ok_time, self.sleep, self.clock)['ok'])
-        finally: os.close(fd)
+    def hold(self, path):
+        import subprocess, sys
+        p = subprocess.Popen([sys.executable, '-c', 'import fcntl,os,sys,time;fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR);'
+                              'fcntl.flock(fd,fcntl.LOCK_EX);print("held",flush=True);time.sleep(30)', path], stdout=subprocess.PIPE)
+        self.assertEqual(p.stdout.readline().strip(), b'held'); self.addCleanup(lambda: (p.kill(), p.wait(), p.stdout.close()))
+        return p
+    def test_real_flock_held_by_subprocess(self):
+        lk = os.path.join(self.d, 'scanner.lock'); self.assertTrue(SG.lock_free(lk))
+        self.hold(lk); self.assertFalse(SG.lock_free(lk))
+        r = SG.guard(4, self.proc, [lk], self.ok_time, self.sleep, self.clock)
+        self.assertFalse(r['ok']); self.assertIn('lock held: scanner.lock', r['busy'])
+    def pair(self, n):
+        src = os.path.join(self.d, f'{n}.new'); dst = os.path.join(self.d, n)
+        for f, t in ((src, 'new'), (dst, 'old')):
+            with open(f, 'w') as fh: fh.write(t)
+        return src, dst
+    def test_recheck_under_lock_scanner_and_freeze(self):
+        src, dst = self.pair('a'); sl = os.path.join(self.d, 'scanner.lock'); hl = os.path.join(self.d, 'h.lock')
+        real = SG.lock_free; calls = {'n': 0}
+        def lf(p):   # free during guard, taken by the scanner by the time we hold execute.lock
+            calls['n'] += 1; return calls['n'] <= 1 and real(p)
+        with mock.patch.object(SG, 'lock_free', side_effect=lf):
+            r = SG.swap([(src, dst)], 0, self.proc, [sl], self.ok_time, self.sleep, self.clock, hl)
+        self.assertFalse(r['ok']); self.assertIn('lock taken', r['reason']); self.assertEqual(open(dst).read(), 'old')
+        times = iter([self.ok_time, dt.datetime(2026, 1, 1, 12, 5)])   # clear at guard, freeze under the lock
+        r = SG.swap([(src, dst)], 0, self.proc, [sl], lambda: next(times), self.sleep, self.clock, hl)
+        self.assertFalse(r['ok']); self.assertIn('freeze', r['reason']); self.assertEqual(open(dst).read(), 'old')
+    def test_partial_multi_pair(self):
+        a, b = self.pair('a'), self.pair('b'); real = os.replace
+        def rep(s, d):
+            if d.endswith('/b'): raise OSError('disk full')
+            real(s, d)
+        with mock.patch.object(SG.os, 'replace', side_effect=rep):
+            r = SG.swap([a, b], 0, self.proc, [], self.ok_time, self.sleep, self.clock, os.path.join(self.d, 'h.lock'))
+        self.assertFalse(r['ok']); self.assertTrue(r['partial']); self.assertEqual(r['swapped'], [os.path.realpath(a[1])])
+        self.assertEqual(r['failed'], os.path.realpath(b[1])); self.assertEqual(open(b[1]).read(), 'old')
+        with mock.patch.object(SG, 'swap', return_value=r): self.assertEqual(SG.main(['swap', *a, *b]), 3)
+    def test_validates_all_before_any_replace(self):
+        a = self.pair('a'); missing = (os.path.join(self.d, 'zz.new'), os.path.join(self.d, 'zz'))
+        r = SG.swap([a, missing], 0, self.proc, [], self.ok_time, self.sleep, self.clock, os.path.join(self.d, 'h.lock'))
+        self.assertFalse(r['ok']); self.assertEqual(open(a[1]).read(), 'old')
+    def test_argv_anywhere(self):
+        self.fake_pid(77, ['/usr/bin/env', 'nice', '-n', '5', 'python3', '/opt/x/scripts/manage.py'])
+        self.assertEqual([p for p, _ in SG.running(self.proc)], [77])
     def test_swap_atomic_same_dir(self):
         src = os.path.join(self.d, 'x.py.new'); dst = os.path.join(self.d, 'x.py')
         with open(src, 'w') as fh: fh.write('new')

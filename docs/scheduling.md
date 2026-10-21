@@ -69,7 +69,7 @@ Alternative: `python3 scripts/shadow_swap.py` with no flags runs its own schedul
 
 ## Swapping files safely
 
-Replace scripts or config only when nothing is mid-run: `python3 scripts/swapguard.py swap x.py.new x.py` (stage the new file in the same directory). It refuses inside `ops.freeze_windows`, waits up to `ops.swap_timeout_s` for execute/manage processes and held locks, then skips with exit 3; it never kills anything. `swapguard.py check` just reports.
+Replace scripts or config only when nothing is mid-run: `python3 scripts/swapguard.py swap x.py.new x.py` (stage the new file in the same directory). It refuses inside `ops.freeze_windows` (minutes past the hour, box local time; set them around your executor schedule), waits up to `ops.swap_timeout_s` for execute/manage processes and held locks, then skips with exit 3; it never kills anything. Under the lock it rechecks the freeze window, the scanner lock and processes. Each file is replaced atomically, but a multi-file set is not: a mid-set failure is reported as partial (exit 3) and must be fixed by hand. `swapguard.py check` just reports.
 
 ## Agent-harness routines
 

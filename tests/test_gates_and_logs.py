@@ -276,11 +276,13 @@ class TestCooldown(GateBase):
         self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"])                  # after 4h
     def test_kinds_that_do_not_trigger(self):
         for l in (self.L(realized_pnl=5, kind="tp"), self.L(kind="manual"), self.L(close_avg=100.2, be_stop=100.1),
-                  self.L(close_avg=100.0, be_stop=100.1),                       # within the 0.18% slippage tolerance
-                  self.L(realized_pnl=-20, equity_at_entry=1000), self.L(realized_pnl=0)):   # 20 < 0.5R (R = 50)
+                  self.L(be_done=True, close_avg=100.0, be_stop=100.1),         # BE fired, within the 0.18% slippage tolerance
+                  self.L(be_done=True, realized_pnl=-20, equity_at_entry=1000), self.L(realized_pnl=0)):   # BE fired, 20 < 0.5R (R = 50)
             write_closed([l]); self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], l)
         for l in (self.L(be_done=True), self.L(be_done=True, close_avg=99.5, be_stop=100.1),   # BE marked, filled far below
-                  self.L(realized_pnl=-30, equity_at_entry=1000)):                                # 30 >= 0.5R
+                  self.L(realized_pnl=-30, equity_at_entry=1000),                                 # 30 >= 0.5R
+                  self.L(close_avg=100.0, be_stop=100.1),                                         # sync 4 (as live): no BE, slip tolerance does not apply
+                  self.L(realized_pnl=-20, equity_at_entry=1000)):                                # sync 4 (as live): no BE, 0.5R does not apply
             write_closed([l]); self.assertTrue(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], l)
         for k in ("stop", "trail", "cut"):
             write_closed([self.L(kind=k)]); self.assertTrue(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], k)

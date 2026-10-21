@@ -62,7 +62,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Universe tier | Volume ranks 1–`universe_size` (25) are `core`. Ranks beyond that (26–40, `ext`) also need a fresh news-analyst rating for the pair (`fundamentals.json`, younger than `news_gate.fresh_hours`), else skip `no_fundamentals` (fails closed). The rank is fixed per scan (`scan.json` `vol_ranks`). `scripts/universe.py`. |
 | Caps | Risk caps (`risk.risk_caps`, `scripts/riskcap.py`): open risk of a position = loss if its CURRENT stop is hit from the live mark, incl. exit taker fee and slippage; 0 only if a stop-out nets ≥ 0 after entry + exit fees and slippage; a manual position with no stop counts 5% of equity. Total open risk + the new trade ≤ `total_pct` (20%) of equity; same-direction BOT open risk + new ≤ `direction_pct` (15%). The new trade is scaled down to the headroom (skip `cap_risk` if it then falls below the minimum). Hard backstop `max_positions` (8). Fail closed: if any position's risk can't be computed (no mark, stop orders covering only part of the size, bot position without a stop, ambiguous ownership, orders unreadable), the slot caps apply: `max_open` (4) overall incl. manual, `max_per_direction` (3) bot positions per side. Entry-only, never closes anything. |
 | Unresolved record | `entry.unresolved_record_block` (on): no entry, either side, on a pair holding a bot record with no matching live position, or a closed bot record whose close line was not found yet. `bot_positions.json` never overwrites another trade's record. |
-| Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (exit at/beyond the BE stop minus a slippage tolerance, or a loss under 0.5R), manual positions and manual closes don't trigger it. A read error skips the entry. |
+| Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (BE must have fired; exit at/beyond the BE stop minus a slippage tolerance, or a loss under 0.5R fee-inclusive), manual positions and manual closes don't trigger it. A read error skips the entry. |
 | No duplicates | No new trade on a pair with any position. |
 | One per run | At most one new open per run. If the best setup fails a check, the next one is tried. |
 | Position mode | Account must be in net (one-way) mode. |
@@ -118,7 +118,7 @@ Either way, manual positions block bot entries on that pair and count toward the
 | Rule | Value |
 |---|---|
 | Source | `fundamentals.json`, written by the news analyst. |
-| Freshness | A rating is valid for `fresh_hours` (4h) from its `ts_utc`, the real rating time. |
+| Freshness | A rating is valid for `fresh_hours` (4.5h) from its `ts_utc`, the real rating time. |
 | Block | Only a fresh opposing rating with medium or high confidence blocks: bearish blocks a long, bullish blocks a short. |
 | Low confidence | Logged only. |
 | Neutral | Never blocks. |
@@ -158,6 +158,8 @@ Read only. No LLM. Runs from plain cron.
 
 ## 3b. Shadow filter variants (`scripts/shadow_variants.py`)
 
+- Own-book cooldown mirrors the live bot: a scratch requires BE to have fired, either exit at/beyond the BE stop (exact price, no slip tolerance in the shadow book) or a fee-inclusive loss under 0.5R. A stop-out before BE always starts the cooldown. Stats recompute R from each row's entry/exit/initial_stop.
+
 Read only. No LLM. Runs from plain cron or as its own loop. Every new `scan.json` is walked by several virtual books
 with different filters (BASELINE = live rules, BASELINE_NO1H, V_1H, V_ATR15, V_RR10, STOCKS_ONLY, V_SLOWTREND, V_CROWD;
 see `config.example.yaml` -> `shadow_variants`). Each book keeps its own caps and tracks its entries to TP / SL / BE /
@@ -195,7 +197,7 @@ Audits the bots against logs and this rulebook. See `prompts/manager.md`.
 ## Known gaps (decide these for your own setup)
 - **Macro events need a source.** The window ships disabled because no calendar ships with this repo. The news analyst can add events to `fundamentals.json` under `macro.events`, or you can wire a calendar.
 - **Break-even uses the current mark price**, not the best price since entry. A move that reaches the trigger and reverses between runs is missed.
-- **Rating validity equals the news cadence (4h).** A late news run leaves a gap where ratings are not fresh but the gate has not failed open yet. Entries are allowed in that gap.
+- **Rating validity (4.5h) is only 30 min longer than the news cadence (4h).** A news run more than 30 min late leaves a gap where ratings are not fresh but the gate has not failed open yet. Entries are allowed in that gap.
 - **Funding is not in R:R or the risk cap** (taker fees and a slippage buffer are). It is logged per position only.
 - **Setup choice:** `execute.py` takes the first (best R:R) setup unless the agent passes `--inst`.
 - **Ownership needs timestamps.** A position the bot opened is recognized by create time (within 120 s of the record or of a bot-prefixed opening order). If the exchange reports a create time far from the order time, the bot treats the position as manual.
