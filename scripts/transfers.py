@@ -8,7 +8,8 @@
       transfers not yet logged and appends them to DATA_DIR/logs/transfers_detect.jsonl. --record also adds them
       (source=blofin_bills, transfer_id kept). Needs a READ key for detect only.
 Writes hold DATA_DIR/transfers.lock and replace the file atomically (.prev kept).
-Dedupe: identical type + amount + ts_utc, or the same exchange transfer_id. Exit codes: 0 ok/dup, 2 bad args, 1 write/API fail, 4 lock busy.
+Dedupe: identical type + amount + ts_utc, or the same exchange transfer_id, in transfers.json AND in the detect log
+(detect is idempotent: repeat runs never re-append a transfer already logged). Exit codes: 0 ok/dup, 2 bad args, 1 write/API fail, 4 lock busy.
 """
 import os, sys, json, time, fcntl, shutil, argparse, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -90,13 +91,32 @@ def fetch_bills(since_ms, get=None):
             rec['ts_ms'] = int(b['ts']); out.append(rec)
     return sorted(out, key=lambda r: r['ts_ms'])
 
+def log_keys():
+    """(keys, transfer_ids) already in the detect log; unreadable lines are ignored."""
+    ks, ids = set(), set()
+    try:
+        with open(detect_log()) as fh:
+            for l in fh:
+                try: r = json.loads(l)
+                except Exception: continue
+                if not isinstance(r, dict): continue
+                ks.add(key(r))
+                if r.get('transfer_id'): ids.add(str(r['transfer_id']))
+    except FileNotFoundError: pass
+    return ks, ids
+
 def detect(since, record=False, get=None):
     found = fetch_bills(int(parse_ts(since).timestamp() * 1000), get)
     have = load_list(); keys = {key(r) for r in have}; ids = {r.get('transfer_id') for r in have if r.get('transfer_id')}
     new = [r for r in found if key(r) not in keys and r.get('transfer_id') not in ids]
-    if new:
+    lk, li = log_keys()   # idempotent detect log: a transfer already in the log is never appended again
+    tolog = [r for r in new if key(r) not in lk and not (r.get('transfer_id') and r['transfer_id'] in li)]
+    if tolog:
         with open(detect_log(), 'a') as fh:
-            for r in new: fh.write(json.dumps(dict(r, detected_utc=iso(dt.datetime.now(dt.timezone.utc)))) + '\n')
+            for r in tolog:
+                fh.write(json.dumps(dict(r, detected_utc=iso(dt.datetime.now(dt.timezone.utc)))) + '\n')
+                lk.add(key(r))
+                if r.get('transfer_id'): li.add(r['transfer_id'])
     added = append(new)[0] if (record and new) else []
     return found, new, added
 
