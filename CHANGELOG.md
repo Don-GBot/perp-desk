@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-21 (sync 7)
+
+- **1H ATR unreadable = skip:** a setup whose 1H ATR is missing, 0 or non-finite (or whose 1H candles can't be fetched) is rejected by `execute.py` with `atr unreadable` and never placed; `composite_score` treats it as unscorable (ranked last).
+- 4H closes are fetched once per symbol in a run's first pass (shared with the BTC 4H trend); the pre-order re-check always refetches. The 1H fetch is shared by ATR and the 1H trend when `entry.trend_1h.bars` equals `scan.candles_limit` (same values as before).
+- Tests: `tests/test_sync7.py` (end-to-end ranking through the real `evaluate()`).
+
 ## 2026-10-21 (sync 5)
 
 - **Composite setup ranking** (`entry.composite`, on): `execute.py` runs every setup through all checks, scores the passing ones (`composite_score`: −0.25 per 1H ATR of target distance beyond 8; 4H EMA gap + min(gap, 3)/3 and −1/3 per % above 3; −0.25 per point of fee_share above 8%; +0.25 if the BTC 4H trend agrees) and tries the top score first. Each candidate is re-checked at the live price just before its order; a failure falls through; still one entry per run. Off = old R:R-first order. The result carries `candidates` and `score`.

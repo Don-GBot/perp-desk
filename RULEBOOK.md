@@ -56,7 +56,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Cost-heavy skip | `entry.cost_heavy_max_share` (0.12): skip `cost_heavy` if `fee_share` (round-trip taker fees / stop-out loss, the same share as `fee_heavy`) is ≥ 12%. Applies to every trade, scaled or not. 0 turns it off. Block line logged. |
 | Side geometry | After rounding: stop < entry < target for longs, target < entry < stop for shorts. |
 | Fresh scan | `scan.json` no older than `max_scan_age_min` (35). |
-| Stop vs ATR | Stop distance ≥ `min_stop_atr` (1) × ATR14 on 1H. The order script allows `atr_tolerance` (0.95) for drift. |
+| Stop vs ATR | Stop distance ≥ `min_stop_atr` (1) × ATR14 on 1H. The order script allows `atr_tolerance` (0.95) for drift. A missing, 0 or non-finite 1H ATR (or unreadable 1H candles) skips the setup (`atr unreadable`, fails closed). |
 | Trend | With the 4H trend: EMA20 > EMA50 and close > EMA50 for longs, mirror for shorts. Flat pairs are skipped. Re-checked at order time. |
 | 1H trend gate | `entry.trend_1h` (on): longs only in a 1H uptrend, shorts only in a 1H downtrend (EMA20/EMA50 + close vs EMA50 on 200 closed 1H candles, `scripts/trend1h.py`). Flat blocks both. A data error skips the setup (fails closed). Logged as `1h_trend`. |
 | Stock perps | `entry.stock_perp_block` (on): no new entries on stock perps (equities, ETFs, index perps, tokenized stocks): the maintained list in `scripts/stockperp.py` OR exchange assetClass Stocks/Indices. Checked first; unreadable metadata for an unlisted pair skips (fails closed). Open positions are never touched. Logged as `stock_perp`. |
@@ -74,7 +74,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 
 ### Setup ranking (`entry.composite`, `execute.composite_score`)
 Score = sum of four terms (higher is better); ties keep scan order, a setup that can't be scored goes last:
-- **Target distance:** −0.25 per 1H ATR of |target − entry| beyond 8 ATR (`target_atr_free`, `target_atr_pen`).
+- **Target distance:** −0.25 per 1H ATR of |target − entry| beyond 8 ATR (`target_atr_free`, `target_atr_pen`). No valid 1H ATR: unscorable.
 - **4H EMA gap** (EMA fast − slow of `trend_filter`, 20/50, in % of EMA slow, in the trade direction): + min(gap, 3) / 3; above 3% (stretched) −1/3 per % beyond 3 (`gap_full_pct`, `gap_over_pen`). A gap against the trade scores negative.
 - **Cost:** −0.25 per percentage point of `fee_share` above 8% (`fee_share_free`, `fee_share_pen`); −1.0 at the 12% `cost_heavy` wall.
 - **BTC 4H trend:** +0.25 if BTC-USDT's 4H trend agrees with the side (`btc_bonus`); unreadable = no bonus.

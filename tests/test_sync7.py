@@ -75,4 +75,13 @@ class TestRankingEndToEnd(NoNetwork):
             plan, why = EX.evaluate(dict(self.setups[0]), dict(equity=1000.0, avail=1000.0, pos=[], ins=INS, warnings=[]))
         self.assertIsNone(plan); self.assertIn("atr unreadable", why)
 
+    def test_1h_fetch_not_shared_when_limits_differ(self):
+        seen = []
+        def candles(inst, bar, limit=None):
+            seen.append((bar, limit)); h = HALF.get(inst, 60)
+            return [[100000 + i * 20, 100000 + i * 20 + h, 100000 + i * 20 - h, 100000 + i * 20 + 10] for i in range(limit or 200)]
+        with mock.patch.object(EX, "candles", candles), mock.patch.object(EX.T1, "BARS", 150):
+            EX.evaluate(dict(self.setups[0]), dict(equity=1000.0, avail=1000.0, pos=[], ins=INS, warnings=[]))
+        self.assertIn(("1H", 150), seen); self.assertIn(("1H", int(EX.config.CFG["scan"]["candles_limit"])), seen)
+
 if __name__ == "__main__": unittest.main()

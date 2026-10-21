@@ -425,10 +425,12 @@ def evaluate(setup, ctx):
     risk = abs(entry - stop)
     rr = price_rr(side, entry, stop, target)
     if rr < MINRR: return None, f'R:R {rr:.2f} < {MINRR:g}'
-    lim = int(config.CFG['scan']['candles_limit']); share1h = TREND1H and T1.BAR == '1H'
-    try: c1 = candles(inst, '1H', max(lim, T1.BARS) if share1h else lim)   # one 1H fetch, shared by ATR and the 1H trend
+    lim = int(config.CFG['scan']['candles_limit']); share1h = TREND1H and T1.BAR == '1H' and T1.BARS == lim
+    # one 1H fetch shared by ATR and the 1H trend only when both asked for the same limit: candles() drops the unconfirmed
+    # bar, so slicing a larger fetch would hand one extra closed bar to the smaller consumer and shift its value
+    try: c1 = candles(inst, '1H', lim)
     except Exception as e: return None, f'atr unreadable: 1H candles error: {str(e)[:120]}'
-    try: a1 = atr(c1[-lim:])
+    try: a1 = atr(c1)
     except Exception as e: return None, f'atr unreadable: {str(e)[:120]}'
     if not _pos_finite(a1): return None, f'atr unreadable: 1H ATR {a1!r} (missing, 0 or non-finite)'
     if risk < ATR_FLOOR * a1: return None, f'stop {risk/a1:.2f}x ATR < {E["min_stop_atr"]:g}'
@@ -441,7 +443,7 @@ def evaluate(setup, ctx):
         tr = trend(c4)[0]
         want = 'up' if side == 'buy' else 'down'
         if tr != want: return None, f'{tf["timeframe"]} trend now {tr}, need {want}'
-    tw, t1d = trend1h_check(inst, side, c1[-T1.BARS:] if share1h else None)
+    tw, t1d = trend1h_check(inst, side, c1 if share1h else None)
     if tw:
         log_block(setup, '1h_trend (data error)' if 'data error' in tw else '1h_trend', tw, ctx, dict(detail=t1d))
         return None, tw
