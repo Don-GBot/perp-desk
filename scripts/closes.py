@@ -18,7 +18,14 @@ Close kind: the record's close_by when manage.py closed it ('cut' = hard cut, 's
 blocking) and a winning one as 'tp'. A manual close done outside manage.py therefore also counts as a stop if it lost.
 Re-entry cooldown (cooldown_check): a close starts one when realized pnl < 0, kind is stop / trail / cut, and it is not
 a break-even scratch (exit at/beyond the recorded be_stop minus a slippage tolerance, or a loss under 0.5R; see
-is_scratch). Manual closes don't.
+is_scratch). The 0.5R uses the FEE-INCLUSIVE planned risk (risk_allin: coins x execute.planned_risk_per_coin(entry,
+initial_stop), the sizing number incl. entry slip); if that can't be computed, price-only risk (coins x |entry - stop|),
+then the old equity_at_entry x risk_per_trade_pct basis, each fallback logged (scratch_basis, SCRATCH_FALLBACKS).
+Manual closes don't.
+R per closed trade (r_multiples, report): R = realized_pnl / fee-inclusive planned risk; R_price = realized_pnl / price-only
+planned risk (kept for history). Coins = size x ctVal, else price-only risk_usdt / |entry - initial_stop| when the
+contract value is missing. Old lines are recomputed the same way by report(); a line with no entry/stop is unknown_R.
+  python3 scripts/closes.py report     # read-only summary of closed_trades.jsonl
 Closes not logged yet are covered too: a pending record (closed_pending.json) on the same pair+side blocks unless it is
 a manual close, for cooldown_hours from pending_since (fail closed until it is resolved).
 A logged line without close_ms uses logged_utc as the close time.
@@ -84,20 +91,70 @@ def close_kind(rec, pnl):
     return 'stop' if pnl is not None and pnl < 0 else 'tp'
 
 SCRATCH_R = 0.5   # a loss under 0.5R is a scratch
+SCRATCH_FALLBACKS = []   # lines whose scratch test could not use the fee-inclusive risk (also logged as a warning)
+
+def _entry_stop(c):
+    e = fnum(c.get('entry')); e = e if e else fnum(c.get('open_avg'))
+    st = fnum(c.get('initial_stop')); st = st if st is not None else fnum(c.get('stop'))
+    return e, st
+
+def coins_of(c):
+    """size x ctVal; if the contract value is missing, price-only risk_usdt / |entry - initial_stop|; else None."""
+    n = fnum(c.get('size') if c.get('size') is not None else c.get('contracts')); cv = fnum(c.get('ctVal'))
+    if n is not None and cv: return n * cv
+    e, st = _entry_stop(c); r = fnum(c.get('risk_usdt'))
+    if r and e is not None and st is not None and e != st: return r / abs(e - st)
+    return None
+
+def risk_allin(c):
+    """Fee-inclusive planned risk (USDT): recorded risk_usdt_allin, else coins x execute.planned_risk_per_coin(entry, stop)."""
+    r = fnum(c.get('risk_usdt_allin'))
+    if r and r > 0: return r
+    e, st = _entry_stop(c); k = coins_of(c)
+    if not k or e is None or st is None or e == st: return None
+    import execute
+    return k * execute.planned_risk_per_coin(e, st)
+
+def risk_price(c):
+    """Price-only planned risk (USDT): risk_usdt, else coins x |entry - stop|."""
+    r = fnum(c.get('risk_usdt'))
+    if r and r > 0: return r
+    e, st = _entry_stop(c); k = coins_of(c)
+    return k * abs(e - st) if k and e is not None and st is not None and e != st else None
+
+def r_multiples(c):
+    """(R, R_price) of a closed-trade line: realized_pnl over the fee-inclusive / price-only planned risk (None if unknown)."""
+    pnl = fnum(c.get('realized_pnl')); ra, rp = risk_allin(c), risk_price(c)
+    if pnl is None: return None, None
+    return (round(pnl / ra, 4) if ra else None), (round(pnl / rp, 4) if rp else None)
+
+def scratch_risk(c):
+    """(risk_usdt, basis) for the 0.5R test: 'allin', else 'price_fallback', else 'equity_fallback', else (None, None)."""
+    ra = risk_allin(c)
+    if ra: return ra, 'allin'
+    rp = risk_price(c); basis = 'price_fallback'
+    if not rp:
+        eq = fnum(c.get('equity_at_entry'))
+        rp = eq * config.CFG['risk']['risk_per_trade_pct'] / 100.0 if eq else None; basis = 'equity_fallback'
+    if rp:
+        SCRATCH_FALLBACKS.append(dict(instId=c.get('instId'), side=c.get('side'), basis=basis, risk=rp))
+        import logging; logging.getLogger('closes').warning(f"be-scratch: fee-inclusive risk not computable for {c.get('instId')} {c.get('side')}; {basis}")
+        return rp, basis
+    return None, None
 
 def is_scratch(c):
     """Break-even scratch ONLY if the exit is at or beyond be_stop in the trade's favour (minus a slippage tolerance of
-    fees.slip_frac x be_stop), or the loss is under SCRATCH_R x the planned risk (risk_per_trade_pct x equity_at_entry).
-    be_done alone is not enough: a BE that was marked but not filled near the BE stop still counts as a loss."""
+    fees.slip_frac x be_stop), or the loss is under SCRATCH_R x the fee-inclusive planned risk (scratch_risk; logged
+    fallbacks). be_done alone is not enough: a BE that was marked but not filled near the BE stop still counts as a loss."""
     slip = float(config.CFG['fees']['slip_frac']); s = norm_side(c.get('side'))
     ex, bes = fnum(c.get('close_avg')), fnum(c.get('be_stop'))
     if ex is not None and bes:
         if s == 'long' and ex >= bes * (1 - slip): return True
         if s == 'short' and ex <= bes * (1 + slip): return True
-    pnl, eq = fnum(c.get('realized_pnl')), fnum(c.get('equity_at_entry'))
-    if pnl is not None and eq:
-        R = eq * config.CFG['risk']['risk_per_trade_pct'] / 100.0
-        if R > 0 and -pnl < SCRATCH_R * R: return True
+    pnl = fnum(c.get('realized_pnl'))
+    if pnl is not None:
+        R, _ = scratch_risk(c)
+        if R and R > 0 and -pnl < SCRATCH_R * R: return True
     return False
 
 def cooldown_trigger(c):
@@ -205,9 +262,11 @@ def record(removed, get, now_ms=None, funding_get=None):
                         open_avg=fnum(h.get('openAveragePrice')), close_avg=fnum(h.get('closeAveragePrice')),
                         realized_pnl=fnum(h.get('realizedPnl')), fee=fnum(h.get('fee')), close_ms=int(fnum(h.get('updateTime'), 0) or 0),
                         initial_stop=rec.get('initial_stop'), target=rec.get('target'), be_done=rec.get('be_done'), be_stop=rec.get('be_stop'),
-                        equity_at_entry=rec.get('equity_at_entry'),
+                        equity_at_entry=rec.get('equity_at_entry'), entry=rec.get('entry_quote'), size=rec.get('size'),
+                        ctVal=rec.get('ctVal'), risk_usdt=rec.get('risk_usdt'), risk_usdt_allin=rec.get('risk_usdt_allin'),
                         asset_class=rec.get('asset_class'), logged_utc=dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
             line['kind'] = close_kind(rec, line['realized_pnl'])
+            line['R'], line['R_price'] = r_multiples(line); line['R_basis'] = 'allin'
             if funding_get is not None:
                 try:
                     import funding
@@ -217,3 +276,21 @@ def record(removed, get, now_ms=None, funding_get=None):
                 append_line(line); lines.append(line)
             except Exception as e: errs.append(f'close {inst}: write failed: {str(e)[:160]}')
     return lines, errs
+
+def report(path=None):
+    """Read-only summary of closed_trades.jsonl. R is RECOMPUTED for every line (old lines included) with r_multiples."""
+    out = dict(R_basis='allin', n=0, wins=0, net_usdt=0.0, netR=0.0, netR_price=0.0, unknown_R=0)
+    for c in load_closed(path):
+        pnl = fnum(c.get('realized_pnl'))
+        if pnl is None: continue
+        out['n'] += 1; out['wins'] += pnl > 0; out['net_usdt'] = round(out['net_usdt'] + pnl, 4)
+        R, Rp = r_multiples(c)
+        if R is None: out['unknown_R'] += 1
+        else: out['netR'] = round(out['netR'] + R, 4)
+        if Rp is not None: out['netR_price'] = round(out['netR_price'] + Rp, 4)
+    return out
+
+if __name__ == '__main__':
+    import sys
+    if sys.argv[1:] != ['report']: print('usage: closes.py report', file=sys.stderr); sys.exit(2)
+    print(json.dumps(report(), indent=1))

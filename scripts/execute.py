@@ -64,7 +64,7 @@ from scan import candles, atr, trend, rr as price_rr, net_rr
 C = config.CFG; R_ = C["risk"]; E = C["entry"]; LV = C["leverage"]; M = C["management"]
 RISK = R_["risk_per_trade_pct"] / 100.0
 FEE = float(C["fees"]["taker_rate"]); SLIP = float(C["fees"]["slip_frac"]); ENTRY_SLIP = float(C["fees"]["entry_slip_frac"])
-SCALE_DOWN = bool(R_["scale_down"]); FEE_HEAVY_MAX = float(R_["fee_heavy_max_share"])
+SCALE_DOWN = bool(R_["scale_down"]); FEE_HEAVY_MAX = float(R_["fee_heavy_max_share"]); MIN_RISK_PCT = float(R_["min_risk_pct"])
 UNRES_BLOCK = bool(E["unresolved_record_block"]); LOG_ALL_SKIPS = bool(C["logging"]["log_all_skips"])
 COOLDOWN_H = float(R_["cooldown_hours"])
 PREFIX = C["bot"]["client_order_prefix"]
@@ -129,13 +129,15 @@ def lev_liq_max(entry, stop, mmr=MMR_DEFAULT, maxlev=LEVMAX):
 def fit_size(equity, avail, entry, stop, cv, lot, mins, maxlev=LEVMAX, mmr=MMR_DEFAULT, risk_cap=None):
     """Shared sizing (execute, shadow_variants, shadow_swap). Returns dict(size, size_full, lev, cap, notional, scaled_down,
     scaled_by, risk_pct_actual, fee_share, gate, why). gate None = may proceed, else 'below_min_size' | 'no_leverage_fit' |
-    'fee_heavy' | 'liq' | 'cap_risk'. Start: the full-risk size (size_for). Scale DOWN only, lot-rounded:
+    'fee_heavy' | 'liq' | 'cap_risk' | 'below_min_risk'. Start: the full-risk size (size_for). Scale DOWN only, lot-rounded:
       1. risk_cap (USDT, risk-cap headroom): size <= risk_cap / (planned loss per contract); below min -> cap_risk
       2. leverage: L <= min(leverage.max, maxlev, lev_liq_max); none -> liq
       3. margin: lowest L whose margin fits min(margin_cap, free margin buffer) (pick_lev); if none, the size that fits at
          the highest allowed L
     A scaled size is skipped if fee_share > fee_heavy_max_share (fee_heavy) or < minSize (below_min_size). fee_heavy applies
     ONLY to scaled-down trades (deliberate, as live): an unscaled full-risk trade is never skipped for its fee share.
+    Finally, ANY trade (scaled or not) whose fee-inclusive planned risk is below risk.min_risk_pct of equity is skipped
+    (below_min_risk).
     risk.scale_down false -> no scaling: no_leverage_fit skip (the liq check then runs in evaluate)."""
     size = size_for(equity, entry, stop, cv, lot); fsh = fee_share(entry, stop)
     out = dict(size=size, size_full=size, lev=None, cap=None, notional=size * cv * entry, scaled_down=False, scaled_by=[],
@@ -166,6 +168,9 @@ def fit_size(equity, avail, entry, stop, cv, lot, mins, maxlev=LEVMAX, mmr=MMR_D
             out.update(gate='below_min_size', why=f"below_min_size: scaled size {out['size']:g} < min {mins:g} (full size {size:g})"); return out
     out['lev'] = L
     out['risk_pct_actual'] = round(out['size'] * loss_per_contract(entry, stop, cv) / equity * 100, 3) if equity else None
+    if MIN_RISK_PCT > 0 and (out['risk_pct_actual'] is None or out['risk_pct_actual'] < MIN_RISK_PCT):
+        out.update(gate='below_min_risk', why=f"below_min_risk: fee-inclusive risk {out['risk_pct_actual']}% of equity < {MIN_RISK_PCT:g}% "
+                                             f"(size {out['size']:g} at {L}x, full size {size:g}, scaled_by {'+'.join(out['scaled_by']) or '-'})")
     return out
 
 def norm_side(s):
@@ -387,7 +392,7 @@ def evaluate(setup, ctx):
     plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr=rr, rr_net=net_rr(side, entry, stop, target),
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
                 stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, entry_slip_frac=ENTRY_SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
-                size_full=sz['size_full'], scaled_down=sz['scaled_down'], scaled_by=sz['scaled_by'], risk_pct_actual=sz['risk_pct_actual'],
+                ctVal=cv, risk_usdt=size * cv * risk, size_full=sz['size_full'], scaled_down=sz['scaled_down'], scaled_by=sz['scaled_by'], risk_pct_actual=sz['risk_pct_actual'],
                 fee_share=sz['fee_share'], universe_tier=UN.tier_of(setup), vol_rank=setup.get('vol_rank'),
                 risk_caps={k: rca.get(k) for k in ('mode', 'total_pct', 'dir_pct', 'headroom', 'n_pos', 'error')},
                 lev_req=dict(instId=inst, leverage=str(lev), marginMode=NEW_MM, positionSide='net'),
@@ -447,7 +452,9 @@ def place(plan):
                entry_quote=plan['entry'], initial_stop=plan['stop'], target=plan['target'], stop_dist=plan['stop_dist'],
                atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False, asset_class=plan.get('asset_class'),
                universe_tier=plan.get('universe_tier'), vol_rank=plan.get('vol_rank'), scaled_down=plan.get('scaled_down'),
-               risk_pct_actual=plan.get('risk_pct_actual'), risk_caps=plan.get('risk_caps'), provisional=True)
+               risk_pct_actual=plan.get('risk_pct_actual'), risk_caps=plan.get('risk_caps'),
+               size=plan.get('size'), ctVal=plan.get('ctVal'), risk_usdt=plan.get('risk_usdt'), risk_usdt_allin=plan.get('est_loss_at_stop'),
+               provisional=True)
     try: registry.put(rec)
     except Exception as e: return dict(ok=False, why=f'bot_positions.json not writable ({str(e)[:120]}); order NOT sent', plan=plan)
     def _drop():

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-21 (sync 4)
+
+- **Minimum risk floor** (`risk.min_risk_pct`, default 1.0): `fit_size` skips an entry as `below_min_risk` (block line logged) when its fee-inclusive risk would be under 1% of equity after scaling. Shadow swap mirrors it through `fit_size`.
+- **One fundamentals freshness setting**: `news_gate.fresh_hours` default 4 -> 4.5; used by the news gate, the opposing-rating check, the ext `no_fundamentals` filter and shadow swap. Cooldown stays `risk.cooldown_hours` (4).
+- **R is fee-inclusive**: `R = pnl_net / planned risk incl. fees and entry slip`; `R_price` (price-only) kept alongside. Close lines and registry records carry `size`, `ctVal`, `risk_usdt`, `risk_usdt_allin`. `python3 scripts/closes.py report` recomputes old lines; lines without entry/stop count as `unknown_R`; a missing ctVal is derived from `risk_usdt / |entry - stop|`. Shadow variant stats rescale old rows the same way.
+- **Break-even scratch** (0.5R, cooldown exemption) uses fee-inclusive R, with a price-only fallback (then equity) that is logged.
+- **Shadow variants**: a post-BE close is cooldown-exempt only if it is a scratch (exit at the BE stop, or R > -0.5); bigger post-BE losses now start the cooldown.
+- **New ops script `scripts/swapguard.py`** (`ops:` config): swap files / restart only when idle. Refuses in freeze windows, waits for running execute/manage processes and held locks (2 s polls, 180 s, then skip with exit 3, never kills), rechecks under execute.lock, atomic `os.replace`.
+
 ## 2026-10-20 (sync 3)
 
 Entry and sizing rules (all on in `config.example.yaml`):

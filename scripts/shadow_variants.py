@@ -278,12 +278,35 @@ def close_row(pos, fill, kind, t_ms, mk):
     pnl = ((fill - e) if lg else (e - fill)) - EX.FEE * (e + fill) - EX.SLIP * e; rpc = EX.planned_risk_per_coin(e, pos['stop0'])
     row = dict(variant=pos['variant'], decision='CLOSE', scan_ts=pos['scan_ts'], rank=pos['rank'], pair=pos['inst'], side=pos['side'],
                kind=kind, entry=e, exit=fill, initial_stop=pos['stop0'], target=pos['target'], R=round(pnl / rpc, 4) if rpc else None,
+               R_price=round(pnl / abs(e - pos['stop0']), 4) if e != pos['stop0'] else None, R_basis='allin',
+               be_scratch=bool(pos['be'] and ((lg and fill >= pos['sl'] * (1 - EX.SLIP)) or (not lg and fill <= pos['sl'] * (1 + EX.SLIP)))),
                pnl_usdt=round(pnl * pos['coins'], 4), be_done=pos['be'], hold_min=round((t_ms - pos['t_entry']) / 60_000, 1),
                widened=pos.get('widened'), asset_class=pos.get('asset_class') or SP.asset_class(pos['inst']),
                universe_tier=pos.get('universe_tier') or UN.CORE, **({'rr_bucket': pos['rr_bucket']} if pos.get('rr_bucket') else {}))
     try: row['funding_paid_est'] = SCW.funding_paid(mk.funding(pos['inst']), pos['side'], e * pos['coins'], pos['t_entry'], t_ms)
     except Exception as x: row['funding_paid_est'] = None; row['funding_error'] = str(x)[:120]
     return row
+
+def cooldown_hit(row):
+    """Own-book cooldown trigger, mirroring closes.cooldown_trigger / is_scratch: a losing stop / trail / cut / be close,
+    unless it is a scratch: exit at/beyond the BE stop (be_scratch), or BE fired and the loss is under SCRATCH_R in
+    fee-inclusive R. A post-BE close is NOT automatically exempt."""
+    import closes
+    R = row.get('R')
+    if R is None or R >= 0 or row.get('kind') not in ('stop', 'trail', 'cut', 'be'): return False
+    if row.get('be_scratch'): return False
+    if row.get('be_done') or row.get('kind') == 'be': return not (R > -closes.SCRATCH_R)
+    return True
+
+def recompute_R(r):
+    """R of a CLOSE row on the fee-inclusive basis: rows without R_basis 'allin' (older versions, R over the loss per coin
+    WITHOUT entry slip) are rescaled: R_allin = R_old x risk_per_coin / planned_risk_per_coin. None if entry/stop unknown."""
+    if r.get('R_basis') == 'allin': return r.get('R')
+    try:
+        e, st = float(r['entry']), float(r['initial_stop'])
+        if r.get('R') is None or e == st: return None
+        return round(float(r['R']) * EX.risk_per_coin(e, st) / EX.planned_risk_per_coin(e, st), 4)
+    except (KeyError, TypeError, ValueError): return None
 
 def pnl_neg(pos, ex):
     e = pos['entry']; fill = ex[0]
@@ -301,9 +324,9 @@ def track(st, mk, equity, now):
                     ex = manage_step(pos, float(mk.ticker(pos['inst'])['last']), equity, mk.atr1h(pos['inst']), nowm)
             except Exception as e: emit(dict(variant=v, decision='TRACK_ERROR', pair=pos['inst'], reason=str(e)[:200])); continue
             if ex:
-                emit(close_row(pos, *ex, mk)); n += 1
+                row = emit(close_row(pos, *ex, mk)); n += 1
                 book['open'].remove(pos); book['closed_n'] = book.get('closed_n', 0) + 1
-                if pnl_neg(pos, ex) and ex[1] in ('stop', 'trail', 'cut') and not pos['be'] and EX.COOLDOWN_H:
+                if cooldown_hit(row) and EX.COOLDOWN_H:
                     book.setdefault('cooldown', {})[f"{pos['inst']}|{pos['side']}"] = ex[2] + int(EX.COOLDOWN_H * 3_600_000)
     return n
 
@@ -357,11 +380,17 @@ def stats(path=None, by=None):
         for x in fh:
             try: r = json.loads(x)
             except Exception: continue
-            if r.get('decision') != 'CLOSE' or r.get('R') is None: continue
+            if r.get('decision') != 'CLOSE': continue
+            R = recompute_R(r)
+            if R is None:
+                k = r.get('variant'); o = out.setdefault(k if not by else f"{k}|{r.get(by)}", dict(n=0, wins=0, sum_R=0.0, pnl_usdt=0.0, unknown_R=0))
+                o['unknown_R'] = o.get('unknown_R', 0) + 1; continue
+            r = dict(r, R=R)
             k = r['variant'] if not by else f"{r['variant']}|{r.get(by)}"
-            o = out.setdefault(k, dict(n=0, wins=0, sum_R=0.0, pnl_usdt=0.0))
+            o = out.setdefault(k, dict(n=0, wins=0, sum_R=0.0, pnl_usdt=0.0, unknown_R=0))
             o['n'] += 1; o['wins'] += r['R'] > 0; o['sum_R'] = round(o['sum_R'] + r['R'], 4); o['pnl_usdt'] = round(o['pnl_usdt'] + (r.get('pnl_usdt') or 0), 4)
-    for o in out.values(): o['avg_R'] = round(o['sum_R'] / o['n'], 4); o['win_rate'] = round(o['wins'] / o['n'], 3)
+    for o in out.values():
+        o['avg_R'] = round(o['sum_R'] / o['n'], 4) if o['n'] else None; o['win_rate'] = round(o['wins'] / o['n'], 3) if o['n'] else None
     return out
 
 def main():

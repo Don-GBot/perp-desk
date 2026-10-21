@@ -81,6 +81,8 @@ examples/             fundamentals.json format
 run.sh                wrapper for cron/systemd (loads .env)
 ```
 
+Ops: `scripts/swapguard.py` swaps files only when the bot is idle (see docs/scheduling.md). Sync 4 added a 1% minimum-risk floor, a single 4.5h fundamentals freshness setting, and fee-inclusive R (`R`, plus `R_price`); see CHANGELOG.
+
 ## License
 
 MIT. See `LICENSE`. Use at your own risk. The software comes with no warranty.

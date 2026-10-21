@@ -112,10 +112,10 @@ class TestEvaluateRiskAndUniverse(GateBase):
         l = BL.load_live()[-1]; self.assertEqual((l['gate_reason'], l['universe_tier'], l['vol_rank']), ('no_fundamentals', 'ext', 33))
     def test_risk_mode_skips_slot_cap_and_scales(self):
         tp = dict(code='0', data=[])
-        with mock.patch.object(EX, 'risk_assess', return_value=dict(mode='risk', headroom=10.0, total_pct=0, dir_pct=0, n_pos=0, error=None)):
+        with mock.patch.object(EX, 'risk_assess', return_value=dict(mode='risk', headroom=20.0, total_pct=0, dir_pct=0, n_pos=0, error=None)):
             plan, why = EX.evaluate(dict(SETUP, _rank=1), self.ctx)
         self.assertIsNotNone(plan, why); self.assertTrue(plan['scaled_down']); self.assertIn('cap_risk', plan['scaled_by'])
-        self.assertAlmostEqual(plan['risk_pct_actual'], 1.0, delta=0.05)
+        self.assertAlmostEqual(plan['risk_pct_actual'], 2.0, delta=0.05)   # headroom 20 USDT = 2% (above min_risk_pct)
     def test_slot_fallback_overall_cap(self):
         ctx = dict(self.ctx, pos=[P(f'X{i}-USDT', 1, 1, 1) for i in range(4)])
         with mock.patch.object(EX, 'risk_assess', return_value=dict(mode='slots', error='x')):

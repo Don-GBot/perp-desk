@@ -87,6 +87,9 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 
 Note: with a small account, low-volatility pairs (1H ATR under ~1%) often fail the leverage fit and never trade. That is expected.
 
+- **Minimum risk** (`risk.min_risk_pct`, 1%): if the fee-inclusive risk after all scaling is below 1% of equity, skip as `below_min_risk` (block line). Not worth the fees.
+- **R** is reported fee-inclusive (`pnl_net / planned risk incl. fees + entry slip`); `R_price` is the price-only number. The 0.5R break-even scratch test uses fee-inclusive R.
+
 ### Orders
 | Rule | Value |
 |---|---|
@@ -121,6 +124,8 @@ Either way, manual positions block bot entries on that pair and count toward the
 | Neutral | Never blocks. |
 | Fail open | If no rating is younger than `fail_open_after_hours` (~5h), or the file is missing, the gate allows entries. |
 | Enforced by | `execute.py`, on every candidate, together with the macro window when enabled. |
+
+- Fundamentals freshness is one setting, `news_gate.fresh_hours` (4.5h), for the gate, the opposing-rating check, `no_fundamentals` and shadow swap. The cooldown (4h) is separate.
 
 ### Logging
 Every run, open position and closed trade goes in `state.json`. Each new entry records its news rating and `scanner_flag` (that pair's flags within the last 2 closed 15m candles, or `[]`).

@@ -38,6 +38,9 @@ risk:
   # false: the old behaviour (skip when the full size doesn't fit).
   scale_down: true
   fee_heavy_max_share: 0.3333333333333333
+  # Minimum trade: skip an entry (below_min_risk, logged as a block line) whose final, fee-inclusive planned risk
+  # (after any scaling) is below this percent of equity. Applies to scaled and unscaled trades; 0 turns it off.
+  min_risk_pct: 1.0
   # Risk-based position caps (scripts/riskcap.py). Open risk of a position = loss if its CURRENT stop is hit,
   # from the live mark, incl. exit taker fee and slippage; 0 only if a stop-out nets >= 0 after entry + exit fees
   # and slippage. Manual position without a stop = manual_no_stop_pct of equity. Caps: all open risk + the new
@@ -200,8 +203,10 @@ management:
 # ---------------------------------------------------------------------------
 news_gate:
   enabled: true
-  # A rating is "fresh" for this many hours after its ts_utc (the real rating time).
-  fresh_hours: 4
+  # A rating is "fresh" for this many hours after its ts_utc (the real rating time). The ONE freshness setting:
+  # the news gate, the opposing-rating block, the ext-tier no_fundamentals check and shadow_swap all use it.
+  # (risk.cooldown_hours is separate.)
+  fresh_hours: 4.5
   # Only fresh opposing ratings with one of these confidences block an entry.
   # Bearish blocks a long, bullish blocks a short. Neutral never blocks. Low is logged only.
   block_confidence:
@@ -283,3 +288,15 @@ shadow_variants:
   crowd_n: 2
   crowd_hours: 72
   rr2_min: 2.0
+
+# ---------------------------------------------------------------------------
+# Ops (scripts/swapguard.py: safe file swaps / restarts while the bot is scheduled)
+# ---------------------------------------------------------------------------
+ops:
+  # Minutes past the hour (box local time) when no swap or restart may start, around your executor schedule
+  # (e.g. executor at :07 / :37 -> "05-15", "35-45"). Ranges are [start, end).
+  freeze_windows: ["05-15", "35-45"]
+  # Wait at most this long for running execute.py / manage.py processes and held locks, polling every
+  # swap_poll_s seconds; then SKIP (exit 3). Nothing is ever killed.
+  swap_timeout_s: 180
+  swap_poll_s: 2

@@ -67,6 +67,10 @@ Enable with `systemctl enable --now shadow-swap.timer`. Make an Executor service
 
 Alternative: `python3 scripts/shadow_swap.py` with no flags runs its own scheduler loop. Use that under a process supervisor if you prefer one long-running process.
 
+## Swapping files safely
+
+Replace scripts or config only when nothing is mid-run: `python3 scripts/swapguard.py swap x.py.new x.py` (stage the new file in the same directory). It refuses inside `ops.freeze_windows`, waits up to `ops.swap_timeout_s` for execute/manage processes and held locks, then skips with exit 3; it never kills anything. `swapguard.py check` just reports.
+
 ## Agent-harness routines
 
 Most harnesses (Grok Bot, Hermes, OpenClaw, Claude Code with a scheduler, and others) have some form of scheduled task, routine or cron job. The pattern is the same everywhere:

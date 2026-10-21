@@ -20,7 +20,7 @@ DEFAULTS = {
     "data_dir": "./data",
     "risk": {"risk_per_trade_pct": 5, "hard_cut_pct": 5.5, "max_open": 4, "max_per_direction": 3,
              "one_new_open_per_run": True, "cooldown_hours": 4,
-             "scale_down": True, "fee_heavy_max_share": 0.3333333333333333,
+             "scale_down": True, "fee_heavy_max_share": 0.3333333333333333, "min_risk_pct": 1.0,
              "risk_caps": {"enabled": True, "total_pct": 20, "direction_pct": 15, "max_positions": 8, "manual_no_stop_pct": 5}},
     "fees": {"taker_rate": 0.0006, "slip_frac": 0.0018, "entry_slip_frac": 0.0018},
     "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True, "adopt_from_history": True},
@@ -35,7 +35,7 @@ DEFAULTS = {
                  "margin_mode": "isolated", "mmr_default": 0.005, "max_stop_to_liq": 0.5},
     "management": {"trail_activate_r": 1.0, "trail_callback_atr": 1.5, "breakeven_at_r": 0.75,
                    "breakeven_fee_legs": 2, "breakeven_trail_atr": 1.0},
-    "news_gate": {"enabled": True, "fresh_hours": 4, "block_confidence": ["medium", "high"],
+    "news_gate": {"enabled": True, "fresh_hours": 4.5, "block_confidence": ["medium", "high"],
                   "fail_open_after_hours": 5},
     "macro_window": {"enabled": False, "hours_before": 2, "hours_after": 1},
     "scanner": {"move_alert_pct": 5, "realert_min_pts": 3, "realert_frac": 0.25, "memory_hours": 24,
@@ -45,6 +45,7 @@ DEFAULTS = {
                 "scheduled_dry_window_s": 1800},
     "shadow_variants": {"enabled": True, "poll_sec": 20, "rr_cap": 10, "atr_widen": 1.5, "slowtrend_z_min": 1.0,
                         "crowd_n": 2, "crowd_hours": 72, "rr2_min": 2.0},
+    "ops": {"freeze_windows": ["05-15", "35-45"], "swap_timeout_s": 180, "swap_poll_s": 2},
 }
 
 # ---- minimal YAML subset parser -----------------------------------------------------------------
@@ -149,6 +150,7 @@ def validate(cfg):
     if h < r: raise ConfigError(f"risk.hard_cut_pct ({h}) must be >= risk.risk_per_trade_pct ({r})")
     _num(cfg, "risk.max_open", 1, integer=True); _num(cfg, "risk.max_per_direction", 1, integer=True)
     _bool(cfg, "risk.one_new_open_per_run"); _num(cfg, "risk.cooldown_hours", 0)
+    if _num(cfg, "risk.min_risk_pct", 0) > cfg["risk"]["risk_per_trade_pct"]: raise ConfigError("risk.min_risk_pct must be <= risk.risk_per_trade_pct")
     _bool(cfg, "risk.scale_down"); _num(cfg, "risk.fee_heavy_max_share", 0, 1, lo_incl=False)
     if not isinstance(cfg["risk"].get("risk_caps"), dict): raise ConfigError("risk.risk_caps must be a mapping")
     _bool(cfg, "risk.risk_caps.enabled")
@@ -202,6 +204,10 @@ def validate(cfg):
     _num(cfg, "scanner.realert_frac", 0); _num(cfg, "scanner.coil_top", 0, integer=True); _num(cfg, "scanner.flag_min_quote_vol_usd", 0)
     if not str(cfg["scanner"]["flag_bar"]).endswith(("m", "H")): raise ConfigError("scanner.flag_bar must look like 15m or 1H")
     _num(cfg, "shadow_swap.hurdle_mult", 0, lo_incl=False); _num(cfg, "shadow_swap.rr_edge", 0); _num(cfg, "shadow_swap.max_age_min", 0, lo_incl=False)
+    _num(cfg, "ops.swap_timeout_s", 0); _num(cfg, "ops.swap_poll_s", 0, lo_incl=False)
+    fw = cfg["ops"]["freeze_windows"]
+    if not isinstance(fw, list) or any(not isinstance(x, str) or len(x.split("-")) != 2 or not all(p.isdigit() and 0 <= int(p) <= 60 for p in x.split("-")) or int(x.split("-")[0]) >= int(x.split("-")[1]) for x in fw):
+        raise ConfigError('ops.freeze_windows must be a list of "MM-MM" minute ranges, e.g. ["05-15", "35-45"]')
     sl = cfg["shadow_swap"]["slots"]
     if not isinstance(sl, list) or not sl or any(isinstance(x, bool) or not isinstance(x, int) or not 0 <= x <= 59 for x in sl):
         raise ConfigError("shadow_swap.slots must be a non-empty list of minutes 0-59")
