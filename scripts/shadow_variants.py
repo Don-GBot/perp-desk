@@ -4,8 +4,8 @@
 
 Each time DATA_DIR/scan.json gets a new ts, every variant walks the setups in scan order like execute.py does and logs
 one row per setup (variant, decision TAKE / SKIP / NOT_REACHED, reason, plan). Each variant keeps its OWN virtual book
-(one entry per scan, max_open / max_per_direction caps, no duplicate pair, its own re-entry cooldown after losing
-stop / trail / cut closes) and tracks each entry to TP / SL / BE /
+(one entry per scan, the live caps on the book: risk caps (riskcap.py) or the slot-cap fallback, no duplicate pair, its own
+re-entry cooldown after losing stop / trail / cut closes, the live universe tiers and fit_size sizing) and tracks each entry to TP / SL / BE /
 trailing stop / hard cut on closed 1m bars with the live exit rules from config.yaml. CLOSE rows carry R, pnl and an
 estimated funding cost (public funding-rate history x notional over the hold).
 
@@ -21,10 +21,14 @@ Books (config.yaml -> shadow_variants):
                  qualifying setups are walked by highest side-aligned z first
   V_CROWD        no longs in the crowd_n crypto pairs of the scan universe with the highest average funding over
                  crowd_hours, no shorts in the crowd_n lowest; a funding read failure blocks ('crowd (data error)')
+  V_RR2          live rules but gross min R:R rr2_min (live: entry.min_rr); walks the scan's setups plus the scan's
+                 rejected rr2_min <= R:R < min_rr setups rebuilt with scan.geometry (rebuild_near), R:R desc;
+                 rows tagged rr_bucket '2-3' | '3+'
+Every row and position carries universe_tier ('core' | 'ext'); --stats --by universe_tier | rr_bucket | asset_class.
 
   python3 scripts/shadow_variants.py           # scheduler: poll scan.json every poll_sec seconds
   python3 scripts/shadow_variants.py --once    # one pass then exit
-  python3 scripts/shadow_variants.py --stats [--by asset_class]   # graded CLOSE rows per variant
+  python3 scripts/shadow_variants.py --stats [--by asset_class|universe_tier|rr_bucket]   # graded CLOSE rows per variant
 
 Files: DATA_DIR/logs/shadow_variants.jsonl (rows) and DATA_DIR/logs/shadow_variants_state.json (books).
 """
@@ -35,13 +39,14 @@ import blofin_client as bf
 import config, news_gate as NG
 import execute as EX
 import trend1h as T1, stockperp as SP, slowcrowd as SCW
+import universe as UN, riskcap as RC, scan as SCN, re
 from scan import candles, atr, trend, rr as price_rr
 
 SV = config.CFG["shadow_variants"]; M = config.CFG["management"]
 RR_CAP = float(SV["rr_cap"]); ATR_WIDEN = float(SV["atr_widen"]); Z_MIN = float(SV["slowtrend_z_min"])
-CROWD_N = int(SV["crowd_n"]); CROWD_H = float(SV["crowd_hours"]); POLL = float(SV["poll_sec"])
+CROWD_N = int(SV["crowd_n"]); CROWD_H = float(SV["crowd_hours"]); POLL = float(SV["poll_sec"]); RR2_MIN = float(SV["rr2_min"])
 HARD_CUT = config.CFG["risk"]["hard_cut_pct"] / 100.0; MANAGE_MS = 15 * 60_000
-VARIANTS = ('BASELINE', 'BASELINE_NO1H', 'V_1H', 'V_ATR15', 'V_RR10', 'STOCKS_ONLY', 'V_SLOWTREND', 'V_CROWD')
+VARIANTS = ('BASELINE', 'BASELINE_NO1H', 'V_1H', 'V_ATR15', 'V_RR10', 'STOCKS_ONLY', 'V_SLOWTREND', 'V_CROWD', 'V_RR2')
 OUT = config.data_path('logs'); LOG = os.path.join(OUT, 'shadow_variants.jsonl'); STATEF = os.path.join(OUT, 'shadow_variants_state.json')
 
 _orig_private = bf.private
@@ -56,6 +61,40 @@ def _ts(x):
     try:
         t = dt.datetime.fromisoformat(str(x).replace('Z', '+00:00')); return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
     except Exception: return None
+
+NOTE = re.compile(r'^(\S+): (buy|sell) R:R ([0-9.]+) <' + re.escape(f'{EX.MINRR:g}') + '$')   # scan.py reject note
+
+def rr_bucket(rr):
+    try: return f'{EX.MINRR:g}+' if float(rr) >= EX.MINRR else f'{RR2_MIN:g}-{EX.MINRR:g}'
+    except (TypeError, ValueError): return None
+
+def near_misses(sc, lo=None):
+    """[(inst, side, rr)] from scan.json 'rejected' notes with lo <= R:R < min_rr."""
+    lo = RR2_MIN if lo is None else lo; out = []
+    for n in sc.get('rejected') or []:
+        m = NOTE.match(str(n))
+        if m and lo <= float(m.group(3)) < EX.MINRR: out.append((m.group(1), m.group(2), float(m.group(3))))
+    return out
+
+def rebuild_near(sc, mk, lo=None):
+    """The scan's rejected lo <= R:R < min_rr setups, rebuilt now with scan.geometry (source 'rr2_rebuilt'). A pair whose
+    rebuild fails, flips side or leaves the band is dropped. The scan's volume rank / tier are kept."""
+    lo = RR2_MIN if lo is None else lo; out = []; tfb = config.CFG['entry']['trend_filter']['timeframe']
+    for inst, side, rr0 in near_misses(sc, lo):
+        try:
+            tk = mk.ticker(inst)
+            g, _ = SCN.geometry(inst, float(tk['bidPrice']), float(tk['askPrice']), candles(inst, '1H'), candles(inst, tfb))
+        except Exception: continue
+        if g and g['side'] == side and lo <= g['rr'] < EX.MINRR:
+            r = (sc.get('vol_ranks') or {}).get(inst)
+            out.append(dict(g, source='rr2_rebuilt', scan_note_rr=rr0, vol_rank=r, universe_tier=UN.tier(r) if r else None))
+    return out
+
+def book_risk(book, side, equity):
+    """riskcap.assess over the variant book (all positions are bot; mark = entry, the book keeps no live mark; stop = sl)."""
+    ps = [dict(instId=p['inst'], positions=(p['coins'] if p['side'] == 'buy' else -p['coins']), averagePrice=p['entry'], markPrice=p['entry']) for p in book['open']]
+    rows = [dict(instId=p['inst'], slTriggerPrice=p['sl']) for p in book['open']]
+    return RC.assess(side, ps, rows, lambda i: 1.0, equity, lambda p: True, EX.FEE, EX.SLIP)
 
 def gated_1h(v): return v == 'V_1H' or (v != 'BASELINE_NO1H' and EX.TREND1H)
 def stock_mode(v):
@@ -136,10 +175,16 @@ def evaluate(v, s, book, mk, equity, scan_ts, now):
         except Exception as e: return 'SKIP', 'stock_perp (data error)', dict(pl, stock_error=str(e)[:160])
         if sm == 'block' and ist: return 'SKIP', f'stock_perp ({how})', pl
         if sm == 'only' and not ist: return 'SKIP', 'not stock_perp', pl
+    uw = UN.block_reason(s, now=now)   # live order: stock block, then the ext-tier fundamentals check (fail closed)
+    if uw: return 'SKIP', uw, pl
     cu = book.setdefault('cooldown', {}).get(f'{inst}|{side}')
     if cu and cu > ms(now): return 'SKIP', f'cooldown until {iso(dt.datetime.fromtimestamp(cu / 1000, dt.timezone.utc))} (variant book)', pl
-    if sum(1 for p in book['open'] if p['side'] == side) >= EX.MAXDIR: return 'SKIP', 'direction cap (variant book)', pl
-    if len(book['open']) >= EX.MAXALL: return 'SKIP', 'overall cap (variant book)', pl
+    if len(book['open']) >= RC.MAX_POS: return 'SKIP', f"max positions {len(book['open'])}/{RC.MAX_POS} (variant book)", pl
+    rca = book_risk(book, side, equity)
+    pl['risk_caps'] = {k: rca.get(k) for k in ('mode', 'total_pct', 'dir_pct', 'headroom', 'error')}
+    if rca['mode'] != 'risk':   # fail closed -> slot caps (as live)
+        if sum(1 for p in book['open'] if p['side'] == side) >= EX.MAXDIR: return 'SKIP', 'direction cap (variant book)', pl
+        if len(book['open']) >= EX.MAXALL: return 'SKIP', 'overall cap (variant book)', pl
     if any(p['inst'] == inst for p in book['open']): return 'SKIP', 'duplicate pair (variant book)', pl
     ng = NG.check(inst, side); pl['news_gate'] = ng.get('reason')
     if ng.get('block'): return 'SKIP', 'news gate: ' + ng['reason'], pl
@@ -170,19 +215,22 @@ def evaluate(v, s, book, mk, equity, scan_ts, now):
     if why: return 'SKIP', why, pl
     risk = abs(entry - stop); rr = price_rr(side, entry, stop, target)
     pl.update(entry=entry, stop=stop, target=target, rr=round(rr, 4), atr1h=a1, tick=tick)
-    if rr < EX.MINRR: return 'SKIP', f'R:R {rr:.2f} < {EX.MINRR:g}', pl
+    if v == 'V_RR2': pl['rr_bucket'] = rr_bucket(rr)
+    minrr = RR2_MIN if v == 'V_RR2' else EX.MINRR
+    if rr < minrr: return 'SKIP', f'R:R {rr:.2f} < {minrr:g}', pl
     if v == 'V_RR10' and rr >= RR_CAP: return 'SKIP', f'rr>={RR_CAP:g} (R:R {rr:.2f})', pl
     if risk < EX.ATR_FLOOR * a1: return 'SKIP', f'stop {risk/a1:.2f}x ATR too tight', pl
     tf = config.CFG['entry']['trend_filter']
     if tf['enabled']:
         tr = trend([x[3] for x in candles(inst, tf['timeframe'])])[0]
         if tr != ('up' if side == 'buy' else 'down'): return 'SKIP', f'{tf["timeframe"]} trend now {tr}', pl
-    size = EX.size_for(equity, entry, stop, cv, lot)
-    if size < mins: return 'SKIP', 'size below min', pl
-    notional = size * cv * entry; avail = max(0.0, equity - sum(p['margin'] for p in book['open']))
-    lev, cap = EX.pick_lev(notional, equity, avail, float(ins.get('maxLeverage') or EX.LEVMAX))
-    if lev is None: return 'SKIP', 'no leverage fits the margin cap', pl
-    liq = EX.est_liq(entry, side, lev, float(ins.get('maintenanceMarginRate') or EX.MMR_DEFAULT))
+    avail = max(0.0, equity - sum(p['margin'] for p in book['open'])); mmr = float(ins.get('maintenanceMarginRate') or EX.MMR_DEFAULT)
+    sz = EX.fit_size(equity, avail, entry, stop, cv, lot, mins, float(ins.get('maxLeverage') or EX.LEVMAX), mmr,
+                     rca.get('headroom') if rca['mode'] == 'risk' else None)   # same sizing as live
+    pl.update(size=sz['size'], scaled_down=sz['scaled_down'], risk_pct_actual=sz['risk_pct_actual'], fee_share=sz['fee_share'])
+    if sz['gate']: return 'SKIP', sz['why'] + (' | ' + RC.summary(rca) if sz['gate'] == 'cap_risk' else ''), pl
+    size, notional, lev = sz['size'], sz['notional'], sz['lev']
+    liq = EX.est_liq(entry, side, lev, mmr)
     if risk >= EX.MAX_STOP_TO_LIQ * abs(liq - entry): return 'SKIP', f'liq too close at {lev}x', pl
     pl.update(coins=size * cv, lev=lev, margin=notional / lev, notional=notional, equity=equity)
     return 'TAKE', 'passes every check', pl
@@ -194,7 +242,8 @@ def open_pos(v, s, rank, pl, scan_ts, now):
                 last_manage=ms(now), equity_at_entry=pl.get('equity'), be=False, best=e, trig=e + M['breakeven_at_r'] * d if lg else e - M['breakeven_at_r'] * d,
                 act=e + M['trail_activate_r'] * d if lg else e - M['trail_activate_r'] * d,
                 cb=float(EX.q(M['trail_callback_atr'] * pl['atr1h'], pl['tick'])), trail_on=False, tbest=None,
-                asset_class=pl.get('asset_class'), widened=pl.get('widened'))
+                asset_class=pl.get('asset_class'), widened=pl.get('widened'), universe_tier=UN.tier_of(s),
+                **({'rr_bucket': pl.get('rr_bucket') or rr_bucket(pl['rr'])} if v == 'V_RR2' else {}))
 
 def step_bars(pos, bars):
     """Exchange-side SL / TP / trailing stop over closed 1m bars. Returns (fill, kind, t_ms) or None."""
@@ -226,11 +275,12 @@ def manage_step(pos, last, equity, a1_now, now_ms):
 
 def close_row(pos, fill, kind, t_ms, mk):
     lg = pos['side'] == 'buy'; e = pos['entry']
-    pnl = ((fill - e) if lg else (e - fill)) - EX.FEE * (e + fill) - EX.SLIP * e; rpc = EX.risk_per_coin(e, pos['stop0'])
+    pnl = ((fill - e) if lg else (e - fill)) - EX.FEE * (e + fill) - EX.SLIP * e; rpc = EX.planned_risk_per_coin(e, pos['stop0'])
     row = dict(variant=pos['variant'], decision='CLOSE', scan_ts=pos['scan_ts'], rank=pos['rank'], pair=pos['inst'], side=pos['side'],
                kind=kind, entry=e, exit=fill, initial_stop=pos['stop0'], target=pos['target'], R=round(pnl / rpc, 4) if rpc else None,
                pnl_usdt=round(pnl * pos['coins'], 4), be_done=pos['be'], hold_min=round((t_ms - pos['t_entry']) / 60_000, 1),
-               widened=pos.get('widened'), asset_class=pos.get('asset_class') or SP.asset_class(pos['inst']))
+               widened=pos.get('widened'), asset_class=pos.get('asset_class') or SP.asset_class(pos['inst']),
+               universe_tier=pos.get('universe_tier') or UN.CORE, **({'rr_bucket': pos['rr_bucket']} if pos.get('rr_bucket') else {}))
     try: row['funding_paid_est'] = SCW.funding_paid(mk.funding(pos['inst']), pos['side'], e * pos['coins'], pos['t_entry'], t_ms)
     except Exception as x: row['funding_paid_est'] = None; row['funding_error'] = str(x)[:120]
     return row
@@ -265,11 +315,18 @@ def process_scan(st, mk, sc, equity, now):
     for v in VARIANTS:
         book = st['books'][v]; taken = None; order = list(enumerate(setups, 1))
         if v == 'V_SLOWTREND': order = sorted(order, key=lambda rs: zkey(rs[1]))
+        if v == 'V_RR2':   # the scan's setups + the rebuilt near misses, R:R desc
+            try: near = rebuild_near(sc, mk)
+            except Exception: near = []
+            order = list(enumerate(sorted(setups + near, key=lambda x: -float(x.get('rr') or 0)), 1))
         for rank, s in order:
-            base = dict(variant=v, scan_ts=scan_ts, rank=rank, pair=s.get('instId'), side=s.get('side'), scan_rr=s.get('rr'))
+            base = dict(variant=v, scan_ts=scan_ts, rank=rank, pair=s.get('instId'), side=s.get('side'), scan_rr=s.get('rr'),
+                        universe_tier=UN.tier_of(s, sc), vol_rank=s.get('vol_rank'))
+            if v == 'V_RR2': base.update(rr_bucket=rr_bucket(s.get('rr')), setup_source=s.get('source', 'scan'))
             if taken: emit(dict(base, decision='NOT_REACHED', reason=f'walk stopped at rank {taken} (one entry per scan)')); continue
             try: dec, why, pl = evaluate(v, s, book, mk, equity, scan_ts, now)
             except Exception as e: dec, why, pl = 'SKIP', f'error: {str(e)[:200]}', {}
+            if v == 'V_RR2' and pl.get('rr_bucket'): base['rr_bucket'] = pl['rr_bucket']   # bucket at the live entry R:R
             emit(dict(base, decision=dec, reason=why, plan=pl))
             if dec == 'TAKE': book['open'].append(open_pos(v, s, rank, pl, scan_ts, now)); taken = rank
         if not setups: emit(dict(variant=v, scan_ts=scan_ts, decision='NO_SETUPS', reason='scan.json has no setups'))

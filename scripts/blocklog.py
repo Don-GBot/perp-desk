@@ -9,7 +9,9 @@ with this CLI (source="agent"):
           [--rank N] [--mode live|dry] [--run-id ID] [--reason TEXT]
 
 Dry runs (execute.py --dry, --mode dry) go to DATA_DIR/logs/blocked_setups_dry.jsonl so they never mix with live lines;
-readers use load_live(), which also ignores any mode=dry line found in the live file.
+readers use load_live(), which also ignores any mode=dry line found in the live file. Exception: a --dry run that is the
+scheduled routine's decision run (env RUN_ID names a manage.py record in runs.json written within
+logging.scheduled_dry_window_s, see scheduled_dry()) logs to the LIVE file with mode="scheduled_dry".
 rating, confidence, rating_ts_utc, sources and flagged_news come from DATA_DIR/fundamentals.json. --run-id defaults to
 env RUN_ID. Dedupe (CLI): same run_id + pair + side + entry already in the log -> not written again (exit 0).
 Exit codes: 0 ok/dup, 1 write failed, 2 bad arguments.
@@ -27,6 +29,33 @@ def log_path(mode=None):
         d = config.data_path('logs'); os.makedirs(d, exist_ok=True)
         return os.path.join(d, 'blocked_setups_dry.jsonl')
     return config.data_path('blocked_setups.jsonl')
+
+SCHED_WINDOW_S = float(config.CFG["logging"]["scheduled_dry_window_s"])
+_SCHED = {}
+
+def scheduled_dry(run_id=None, now=None):
+    """True when a dry run is the scheduled routine's decision run: run_id (default env RUN_ID) matches a runs.json record
+    written by manage.py within SCHED_WINDOW_S. Ad-hoc dry runs (no run id, or an unknown/old one) stay dry.
+    Logging only: never changes a gate or an order. Never raises (any doubt -> False)."""
+    rid = run_id if run_id is not None else (os.environ.get('RUN_ID') or '')
+    if not rid: return False
+    if rid in _SCHED and now is None: return _SCHED[rid]
+    ok = False
+    try:
+        import runlog
+        with open(config.data_path(runlog.FILE)) as fh: runs = json.load(fh) or []
+        for r in runs[-50:]:
+            if isinstance(r, dict) and r.get('run_id') == rid and r.get('source') == runlog.SOURCE:
+                t = _ts(r.get('ts_utc'))
+                ok = bool(t) and abs(((now or dt.datetime.now(dt.timezone.utc)) - t).total_seconds()) <= SCHED_WINDOW_S; break
+    except Exception: ok = False
+    if now is None: _SCHED[rid] = ok
+    return ok
+
+def mode_for(dry, run_id=None):
+    """'live' | 'dry' | 'scheduled_dry' for a line written by a (dry) run."""
+    if not dry: return 'live'
+    return 'scheduled_dry' if scheduled_dry(run_id) else 'dry'
 
 def load_live(path=None):
     """Lines of the live log, excluding mode=dry."""
@@ -97,7 +126,7 @@ def main(argv=None):
     a = sub.add_parser('add')
     a.add_argument('--pair', required=True); a.add_argument('--side', required=True, choices=['long', 'short'])
     for k in ('entry', 'sl', 'tp', 'rr'): a.add_argument('--' + k, required=True, type=float)
-    a.add_argument('--rank', type=int); a.add_argument('--mode', choices=['live', 'dry'], default='live')
+    a.add_argument('--rank', type=int); a.add_argument('--mode', choices=['live', 'dry', 'scheduled_dry'], default='live')
     a.add_argument('--run-id', default=None); a.add_argument('--reason', default=None)
     try: o = ap.parse_args(argv)
     except SystemExit as e: return 0 if e.code == 0 else 2

@@ -19,15 +19,17 @@ class ConfigError(ValueError):
 DEFAULTS = {
     "data_dir": "./data",
     "risk": {"risk_per_trade_pct": 5, "hard_cut_pct": 5.5, "max_open": 4, "max_per_direction": 3,
-             "one_new_open_per_run": True, "cooldown_hours": 4},
-    "fees": {"taker_rate": 0.0006, "slip_frac": 0.0018},
-    "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True},
+             "one_new_open_per_run": True, "cooldown_hours": 4,
+             "scale_down": True, "fee_heavy_max_share": 0.3333333333333333,
+             "risk_caps": {"enabled": True, "total_pct": 20, "direction_pct": 15, "max_positions": 8, "manual_no_stop_pct": 5}},
+    "fees": {"taker_rate": 0.0006, "slip_frac": 0.0018, "entry_slip_frac": 0.0018},
+    "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True, "adopt_from_history": True},
     "entry": {"min_rr": 3, "min_stop_atr": 1, "atr_tolerance": 0.95,
               "trend_filter": {"enabled": True, "timeframe": "4H", "ema_fast": 20, "ema_slow": 50},
               "max_scan_age_min": 35,
               "trend_1h": {"enabled": True, "bar": "1H", "bars": 200, "ema_fast": 20, "ema_slow": 50},
-              "stock_perp_block": {"enabled": True}},
-    "scan": {"universe_size": 25, "max_spread_pct": 0.1, "swing_lookback_1h": 12, "swing_buffer_atr": 0.25,
+              "stock_perp_block": {"enabled": True}, "unresolved_record_block": True},
+    "scan": {"universe_size": 25, "universe_ext_enabled": True, "universe_ext_size": 40, "max_spread_pct": 0.1, "swing_lookback_1h": 12, "swing_buffer_atr": 0.25,
              "target_lookback_4h": 60, "atr_period": 14, "candles_limit": 200},
     "leverage": {"min": 3, "max": 20, "margin_cap_pct": 25, "free_margin_buffer": 0.95,
                  "margin_mode": "isolated", "mmr_default": 0.005, "max_stop_to_liq": 0.5},
@@ -38,10 +40,11 @@ DEFAULTS = {
     "macro_window": {"enabled": False, "hours_before": 2, "hours_after": 1},
     "scanner": {"move_alert_pct": 5, "realert_min_pts": 3, "realert_frac": 0.25, "memory_hours": 24,
                 "coil_ratio": 0.5, "coil_top": 3, "flag_min_quote_vol_usd": 1000000, "flag_bar": "15m"},
-    "shadow_swap": {"hurdle_mult": 1.2, "rr_edge": 0.5, "max_age_min": 60, "slots": [9, 24, 39, 54]},
-    "logging": {"blocked_setups": True, "funding": True, "run_records": True},
+    "shadow_swap": {"hurdle_mult": 1.2, "rr_edge": 0.5, "max_age_min": 35, "slots": [9, 24, 39, 54]},
+    "logging": {"blocked_setups": True, "funding": True, "run_records": True, "log_all_skips": True,
+                "scheduled_dry_window_s": 1800},
     "shadow_variants": {"enabled": True, "poll_sec": 20, "rr_cap": 10, "atr_widen": 1.5, "slowtrend_z_min": 1.0,
-                        "crowd_n": 2, "crowd_hours": 72},
+                        "crowd_n": 2, "crowd_hours": 72, "rr2_min": 2.0},
 }
 
 # ---- minimal YAML subset parser -----------------------------------------------------------------
@@ -146,29 +149,39 @@ def validate(cfg):
     if h < r: raise ConfigError(f"risk.hard_cut_pct ({h}) must be >= risk.risk_per_trade_pct ({r})")
     _num(cfg, "risk.max_open", 1, integer=True); _num(cfg, "risk.max_per_direction", 1, integer=True)
     _bool(cfg, "risk.one_new_open_per_run"); _num(cfg, "risk.cooldown_hours", 0)
-    _num(cfg, "fees.taker_rate", 0, 0.01); _num(cfg, "fees.slip_frac", 0, 0.05)
+    _bool(cfg, "risk.scale_down"); _num(cfg, "risk.fee_heavy_max_share", 0, 1, lo_incl=False)
+    if not isinstance(cfg["risk"].get("risk_caps"), dict): raise ConfigError("risk.risk_caps must be a mapping")
+    _bool(cfg, "risk.risk_caps.enabled")
+    rt = _num(cfg, "risk.risk_caps.total_pct", 0, 100, lo_incl=False); rd = _num(cfg, "risk.risk_caps.direction_pct", 0, 100, lo_incl=False)
+    if rd > rt: raise ConfigError("risk.risk_caps.direction_pct must be <= total_pct")
+    _num(cfg, "risk.risk_caps.max_positions", 1, integer=True); _num(cfg, "risk.risk_caps.manual_no_stop_pct", 0, 100)
+    _num(cfg, "fees.taker_rate", 0, 0.01); _num(cfg, "fees.slip_frac", 0, 0.05); _num(cfg, "fees.entry_slip_frac", 0, 0.05)
     p = cfg["bot"]["client_order_prefix"]
     if not isinstance(p, str) or not p.isalnum() or not 1 <= len(p) <= 8:
         raise ConfigError(f"bot.client_order_prefix must be 1-8 letters/digits, got {p!r}")
-    _bool(cfg, "bot.protect_manual_trades")
+    _bool(cfg, "bot.protect_manual_trades"); _bool(cfg, "bot.adopt_from_history")
     _num(cfg, "entry.min_rr", 0, lo_incl=False); _num(cfg, "entry.min_stop_atr", 0)
     _num(cfg, "entry.atr_tolerance", 0, 1, lo_incl=False); _num(cfg, "entry.max_scan_age_min", 0, lo_incl=False)
-    _bool(cfg, "entry.trend_1h.enabled"); _bool(cfg, "entry.stock_perp_block.enabled")
+    _bool(cfg, "entry.trend_1h.enabled"); _bool(cfg, "entry.stock_perp_block.enabled"); _bool(cfg, "entry.unresolved_record_block")
     t1 = cfg["entry"]["trend_1h"]
     a1 = _num(cfg, "entry.trend_1h.ema_fast", 1, integer=True); b1 = _num(cfg, "entry.trend_1h.ema_slow", 1, integer=True)
     if a1 >= b1: raise ConfigError("entry.trend_1h.ema_fast must be smaller than ema_slow")
     if _num(cfg, "entry.trend_1h.bars", 1, 1440, integer=True) < b1: raise ConfigError("entry.trend_1h.bars must be >= ema_slow")
     if t1["bar"] not in ("15m", "30m", "1H", "2H", "4H"): raise ConfigError(f"entry.trend_1h.bar not supported: {t1['bar']!r}")
-    for k in ("blocked_setups", "funding", "run_records"): _bool(cfg, "logging." + k)
+    for k in ("blocked_setups", "funding", "run_records", "log_all_skips"): _bool(cfg, "logging." + k)
+    _num(cfg, "logging.scheduled_dry_window_s", 0)
     _bool(cfg, "shadow_variants.enabled"); _num(cfg, "shadow_variants.poll_sec", 1); _num(cfg, "shadow_variants.rr_cap", 0, lo_incl=False)
     _num(cfg, "shadow_variants.atr_widen", 0, lo_incl=False); _num(cfg, "shadow_variants.slowtrend_z_min", 0)
     _num(cfg, "shadow_variants.crowd_n", 1, integer=True); _num(cfg, "shadow_variants.crowd_hours", 1)
+    _num(cfg, "shadow_variants.rr2_min", 0, lo_incl=False)
     tf = cfg["entry"]["trend_filter"]
     _bool(cfg, "entry.trend_filter.enabled")
     f = _num(cfg, "entry.trend_filter.ema_fast", 1, integer=True); s = _num(cfg, "entry.trend_filter.ema_slow", 1, integer=True)
     if f >= s: raise ConfigError("entry.trend_filter.ema_fast must be smaller than ema_slow")
     if tf["timeframe"] not in ("1H", "2H", "4H", "6H", "8H", "12H", "1D"): raise ConfigError(f"entry.trend_filter.timeframe not supported: {tf['timeframe']!r}")
-    _num(cfg, "scan.universe_size", 1, integer=True); _num(cfg, "scan.max_spread_pct", 0, lo_incl=False)
+    us = _num(cfg, "scan.universe_size", 1, integer=True); _bool(cfg, "scan.universe_ext_enabled")
+    if _num(cfg, "scan.universe_ext_size", 1, integer=True) < us: raise ConfigError("scan.universe_ext_size must be >= scan.universe_size")
+    _num(cfg, "scan.max_spread_pct", 0, lo_incl=False)
     _num(cfg, "scan.swing_lookback_1h", 1, integer=True); _num(cfg, "scan.swing_buffer_atr", 0)
     _num(cfg, "scan.target_lookback_4h", 1, integer=True); _num(cfg, "scan.atr_period", 1, integer=True)
     _num(cfg, "scan.candles_limit", 60, 1440, integer=True)

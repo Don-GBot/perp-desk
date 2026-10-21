@@ -4,7 +4,9 @@
 Rules (all values from config.yaml -> scan / entry / fees):
   - Universe: USDT perps of any asset class, state "live", no scheduled offTime (stock perps are blocked later by
     execute.py's stock-perp gate; commodities and forex are allowed)
-    (delisting), ranked by 24h quote volume; top `universe_size`, then drop spread > `max_spread_pct`.
+    (delisting), ranked by 24h quote volume; top universe.top_n() (`universe_size`, or `universe_ext_size` when
+    `universe_ext_enabled`), then drop spread > `max_spread_pct`. The volume rank (before the spread filter) is stored
+    per scan: scan.json 'vol_ranks', and each setup's 'vol_rank' and 'universe_tier' ('core' | 'ext', universe.py).
   - Only CLOSED candles (confirm == "1") are used for trend, ATR, swing and target.
   - Trend: 4H EMA fast/slow. Up = fast > slow and close > slow. Down = mirror. Flat pairs are skipped.
   - Long: entry = ask. Stop = lower of (lowest low of last N 1H candles - buffer x ATR) and
@@ -19,6 +21,7 @@ import os, sys, json, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
 import config
+import universe as UN
 
 C = config.CFG; S = C["scan"]; E = C["entry"]; FEE = float(C["fees"]["taker_rate"])
 
@@ -71,9 +74,14 @@ def tradable_instruments():
             and x['instId'].endswith('-USDT')}
 
 def universe(top=None, max_spread_pct=None):
-    """Top N tradable USDT perps by 24h quote volume, then drop wide spreads.
+    """Top N (default universe.top_n()) tradable USDT perps by 24h quote volume, then drop wide spreads.
     Returns (rows, tickers_by_inst); rows = [(quote_vol, instId, last, bid, ask, spread_frac)]."""
-    top = top or S["universe_size"]
+    rows, t, _ = universe_ranked(top, max_spread_pct)
+    return rows, t
+
+def universe_ranked(top=None, max_spread_pct=None):
+    """Like universe() plus {instId: volume rank} over the top N before the spread filter."""
+    top = top or UN.top_n()
     max_spread = (S["max_spread_pct"] if max_spread_pct is None else max_spread_pct) / 100.0
     ok = tradable_instruments()
     t = bf.public('/api/v1/market/tickers')['data']
@@ -85,44 +93,57 @@ def universe(top=None, max_spread_pct=None):
         qv = float(x['volCurrency24h'] or 0) * last
         rows.append((qv, x['instId'], last, bid, ask, (ask - bid) / last))
     rows.sort(reverse=True)
-    return [r for r in rows[:top] if r[5] <= max_spread], {x['instId']: x for x in t}
+    ranks = {r[1]: k for k, r in enumerate(rows[:top], 1)}
+    return [r for r in rows[:top] if r[5] <= max_spread], {x['instId']: x for x in t}, ranks
 
-def scan():
-    liquid, _ = universe()
-    tf = E["trend_filter"]; min_rr = E["min_rr"]; k_atr = E["min_stop_atr"]
+def geometry(inst, bid, ask, h1, h4):
+    """The scan's setup for one pair from bid/ask and closed 1H / trend-timeframe rows. Returns (setup, None) or
+    (None, note). Shared with shadow_variants' V_RR2 rebuild, so both use exactly the same stop/target rules."""
+    tf = E["trend_filter"]; k_atr = E["min_stop_atr"]
     nsw = S["swing_lookback_1h"]; buf = S["swing_buffer_atr"]; ntg = S["target_lookback_4h"]
+    try:
+        a1 = atr(h1)
+        if len(h4) < tf["ema_slow"] + 1 or len(h1) < nsw or len(h4) < ntg: raise ValueError("not enough closed candles")
+        tr, e1, e2, _ = trend([x[3] for x in h4])
+    except Exception as e:
+        return None, f'{inst}: data error {str(e)[:120]}'
+    if not tf["enabled"]:
+        tr = 'up' if e1 >= e2 else 'down'  # filter off: side from EMA order only, no flat skip
+    if tr == 'flat': return None, f'{inst}: {tf["timeframe"]} flat'
+    if tr == 'up':
+        entry = ask
+        swing = min(x[2] for x in h1[-nsw:])
+        stop = min(swing - buf * a1, entry - k_atr * a1)
+        target = max(x[1] for x in h4[-ntg:])
+        risk = entry - stop; side = 'buy'
+    else:
+        entry = bid
+        swing = max(x[1] for x in h1[-nsw:])
+        stop = max(swing + buf * a1, entry + k_atr * a1)
+        target = min(x[2] for x in h4[-ntg:])
+        risk = stop - entry; side = 'sell'
+    r_ = rr(side, entry, stop, target)
+    return dict(instId=inst, side=side, trend4h=tr, entry=entry, stop=stop, target=target, atr1h=a1,
+                stop_atr=risk / a1 if a1 else None, rr=round(r_, 2), rr_net=round(net_rr(side, entry, stop, target), 2)), None
+
+def scan(top=None):
+    top = top or UN.top_n()
+    liquid, _, ranks = universe_ranked(top)
+    tf = E["trend_filter"]; min_rr = E["min_rr"]
     setups = []; notes = []
     for qv, inst, last, bid, ask, spread in liquid:
-        try:
-            h1 = candles(inst, '1H'); h4 = candles(inst, tf["timeframe"])
-            a1 = atr(h1)
-            if len(h4) < tf["ema_slow"] + 1 or len(h1) < nsw or len(h4) < ntg: raise ValueError("not enough closed candles")
-            tr, e1, e2, _ = trend([x[3] for x in h4])
+        try: h1 = candles(inst, '1H'); h4 = candles(inst, tf["timeframe"])
         except Exception as e:
             notes.append(f'{inst}: data error {str(e)[:120]}'); continue
-        if not tf["enabled"]:
-            tr = 'up' if e1 >= e2 else 'down'  # filter off: side from EMA order only, no flat skip
-        if tr == 'flat': notes.append(f'{inst}: {tf["timeframe"]} flat'); continue
-        if tr == 'up':
-            entry = ask
-            swing = min(x[2] for x in h1[-nsw:])
-            stop = min(swing - buf * a1, entry - k_atr * a1)
-            target = max(x[1] for x in h4[-ntg:])
-            risk = entry - stop; side = 'buy'
-        else:
-            entry = bid
-            swing = max(x[1] for x in h1[-nsw:])
-            stop = max(swing + buf * a1, entry + k_atr * a1)
-            target = min(x[2] for x in h4[-ntg:])
-            risk = stop - entry; side = 'sell'
-        r_ = rr(side, entry, stop, target)
-        s = dict(instId=inst, side=side, trend4h=tr, entry=entry, stop=stop, target=target, atr1h=a1,
-                 stop_atr=risk / a1 if a1 else None, rr=round(r_, 2), rr_net=round(net_rr(side, entry, stop, target), 2), vol_usd=round(qv), spread=spread)
+        s, note = geometry(inst, bid, ask, h1, h4)
+        if s is None: notes.append(note); continue
+        s.update(vol_usd=round(qv), spread=spread, vol_rank=ranks[inst], universe_tier=UN.tier(ranks[inst]))
+        r_ = rr(s['side'], s['entry'], s['stop'], s['target'])
         if r_ >= min_rr: setups.append(s)
-        else: notes.append(f'{inst}: {side} R:R {r_:.2f} <{min_rr:g}')
+        else: notes.append(f"{inst}: {s['side']} R:R {r_:.2f} <{min_rr:g}")
     setups.sort(key=lambda s: -s['rr'])
     return dict(ts=dt.datetime.now(dt.timezone.utc).isoformat(), fee_rate=FEE, universe=[r[1] for r in liquid],
-                setups=setups, rejected=notes)
+                setups=setups, rejected=notes, top_n=top, vol_ranks=ranks, universe_tiers={i: UN.tier(k) for i, k in ranks.items()})
 
 def write_atomic(path, obj):
     tmp = path + '.tmp'

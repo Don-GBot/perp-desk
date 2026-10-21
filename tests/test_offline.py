@@ -124,7 +124,7 @@ class TestExecuteValidation(NoNetwork):
                         mock.patch.object(EX, "candles", fake_candles_up)]
         for p in self.patches: p.start()
         self.ctx = dict(equity=1000.0, avail=1000.0, pos=[], ins=INS)
-        registry.save_pending([])
+        registry.save_pending([]); registry.save({})   # no leftover bot record (unresolved_record_block)
         self.fresh = dt.datetime.now(dt.timezone.utc).isoformat()
     def tearDown(self):
         for p in self.patches: p.stop()

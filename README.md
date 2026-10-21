@@ -23,10 +23,10 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 
 ## How the pieces fit
 
-1. `scripts/scan.py` ranks the top 25 USDT perps by volume (crypto, commodities, forex; stock perps are blocked later), drops wide spreads, keeps pairs in a 4H trend, and builds setups with price-only R:R ≥ 3. Output: `data/scan.json`.
+1. `scripts/scan.py` ranks the top 40 USDT perps by volume (crypto, commodities, forex; stock perps are blocked later), drops wide spreads, keeps pairs in a 4H trend, and builds setups with price-only R:R ≥ 3. Ranks 1–25 are the core universe; ranks 26–40 (`ext`) only trade with a fresh news-analyst rating (`scripts/universe.py`). Output: `data/scan.json`.
 2. `scripts/scanner.py` (optional) writes alerts and info-only flags to `data/flags_latest.json`.
 3. The news analyst rates each pair and writes `data/fundamentals.json`.
-4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, 1H trend gate, stock-perp block, caps), and opens at most one trade with `scripts/execute.py`. Every gate block is logged to `data/blocked_setups.jsonl`; `manage.py` writes run records, closed trades and funding paid.
+4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, 1H trend gate, stock-perp block, universe tier, risk caps), sizes the trade (5% risk is a maximum, scaled down to the binding limit), and opens at most one trade with `scripts/execute.py`. Every skip is logged to `data/blocked_setups.jsonl`; `manage.py` writes run records, closed trades and funding paid.
 5. `scripts/shadow_swap.py` logs whether swapping an open trade for a new setup would have paid. `scripts/shadow_variants.py` runs the same setups through alternative filter sets in virtual books. Neither ever trades.
 6. The Manager audits everything against `RULEBOOK.md` and the logs.
 
@@ -53,7 +53,7 @@ Needs Python 3.9+. No pip packages (PyYAML is used if installed).
 
 Defaults live in `config.example.yaml`. To change them, copy it to `config.yaml` in the repo root (or point `BOT_CONFIG` at a file) and edit. Bad values stop the scripts with a clear error.
 
-**How much is at risk.** Each trade risks `risk_per_trade_pct` (default 5%) of equity at the stop, fees and a 0.18% slippage buffer included. With `max_open: 4`, up to 4 × 5% = 20% of equity can be at risk at once. Gaps and slippage can make a loss bigger than planned. Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
+**How much is at risk.** Each trade risks at most `risk_per_trade_pct` (default 5%) of equity at the stop, fees, a 0.18% entry slippage and a 0.18% exit slippage buffer included; it is scaled down when leverage, margin, liquidation distance or the risk caps don't allow the full size. The risk caps (`risk.risk_caps`, `scripts/riskcap.py`) keep total open risk at the current stops ≤ 20% of equity and same-direction bot risk ≤ 15%, with at most 8 positions; if the open risk can't be computed, the old slot caps (4 open, 3 bot per side) apply. Gaps and slippage can make a loss bigger than planned. Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
 
 ## Adapting it to your harness
 
@@ -73,7 +73,7 @@ RULEBOOK.md           the rules, in plain words
 prompts/              one role prompt per agent
 scripts/              Python scripts (stdlib only): scan, scanner, execute, manage, news_gate, shadow_swap,
                       shadow_variants, transfers, runlog, blocklog, plus helpers: trend1h, stockperp,
-                      slowcrowd, closes, funding, registry, blofin_client, config, lock
+                      universe, riskcap, slowcrowd, closes, funding, registry, blofin_client, config, lock
 docs/                 architecture, scheduling, usage costs
 tests/                offline unit tests (no network, no orders)
 CHANGELOG.md          what changed, by date

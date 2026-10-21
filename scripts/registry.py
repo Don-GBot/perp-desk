@@ -90,5 +90,30 @@ def prune(positions, reg=None):
     keep, removed = prune_full(positions, reg)
     return keep, sorted(removed)
 
+class UnresolvedRecord(RuntimeError):
+    """put() refused: another (unresolved) bot record holds the pair."""
+
+def same_record(old, rec):
+    if old.get("clientOrderId") and old.get("clientOrderId") == rec.get("clientOrderId"): return True
+    a, b = old.get("position_createTime"), rec.get("position_createTime")
+    return bool(a) and str(a) == str(b)
+
 def put(rec):
-    reg = load(); reg[rec["instId"]] = rec; save(reg)
+    """Write rec for its pair. Never overwrites a DIFFERENT record on the same pair (same clientOrderId or same
+    position_createTime = the same trade, an update): raises UnresolvedRecord instead."""
+    reg = load(); old = reg.get(rec["instId"])
+    if isinstance(old, dict) and not same_record(old, rec):
+        raise UnresolvedRecord(f'{rec["instId"]}: unresolved bot record (opened {old.get("opened_at")}) present: not overwritten')
+    reg[rec["instId"]] = rec; save(reg)
+
+def unresolved(inst, positions, reg=None, pending=None):
+    """Reason string if the pair holds an unresolved bot record (either side): a record matching no live position on
+    the pair, or a pruned record (closed_pending.json) whose close line was not found yet (however it was closed); else None. Read errors raise (callers fail closed)."""
+    reg = load_strict() if reg is None else reg
+    rec = reg.get(inst)
+    if isinstance(rec, dict) and not any(p.get("instId") == inst and matches(p, rec) for p in positions):
+        return f'unresolved_record ({inst} {rec.get("side")} bot record opened {rec.get("opened_at")} has no live position and no close record yet)'
+    for r in (load_pending() if pending is None else pending):
+        if r.get("instId") == inst:
+            return f'unresolved_record ({inst} {r.get("side")} bot record closed, close line not found yet, pending since {r.get("pending_since")})'
+    return None

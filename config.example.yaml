@@ -23,11 +23,33 @@ risk:
   # any position already down this much. With protect_manual_trades it only touches bot positions.
   # Must be >= risk_per_trade_pct. Keep it a bit above to leave room for slippage.
   hard_cut_pct: 5.5
-  # Max open positions overall (all positions, manual included), and max open BOT positions per
-  # direction (long / short; manual positions are not counted). Entry-only: never closes anything.
-  # If the bot positions can't be read, the entry is skipped.
+  # Slot caps, used ONLY as the fail-closed fallback when risk_caps is off or the open risk of some position
+  # can't be computed: max open positions overall (manual included) and max open BOT positions per direction
+  # (manual positions are not counted). Entry-only: never closes anything. If the bot positions can't be read,
+  # the entry is skipped.
   max_open: 4
   max_per_direction: 3
+  # risk_per_trade_pct is a MAXIMUM. true: a trade whose full-risk size doesn't fit is scaled DOWN (never up,
+  # lot-rounded) to the binding limit: leverage.max, the instrument max leverage, the margin cap / free margin,
+  # the highest leverage whose estimated liquidation is > 1/max_stop_to_liq x the stop distance, and the
+  # risk_caps headroom. A scaled trade is skipped as fee_heavy if round-trip taker fees are more than
+  # fee_heavy_max_share of its stop-out loss, or below_min_size under the instrument minimum.
+  # false: the old behaviour (skip when the full size doesn't fit).
+  scale_down: true
+  fee_heavy_max_share: 0.3333333333333333
+  # Risk-based position caps (scripts/riskcap.py). Open risk of a position = loss if its CURRENT stop is hit,
+  # from the live mark, incl. exit taker fee and slippage; 0 only if a stop-out nets >= 0 after entry + exit fees
+  # and slippage. Manual position without a stop = manual_no_stop_pct of equity. Caps: all open risk + the new
+  # trade <= total_pct of equity; same-direction BOT open risk + new <= direction_pct. The new trade is scaled
+  # down to the headroom (skip cap_risk if it then falls below the minimum). max_positions is a hard backstop.
+  # If any position's risk can't be computed (no mark, stop covering only part of the size, bot position
+  # without a stop, ambiguous ownership, orders unreadable) the slot caps above apply instead (fail closed).
+  risk_caps:
+    enabled: true
+    total_pct: 20
+    direction_pct: 15
+    max_positions: 8
+    manual_no_stop_pct: 5
   # Re-entry cooldown: after a bot position closes at a loss by its stop-loss, trailing stop or hard cut,
   # no new entry on that pair in the same direction for this many hours from the close. The opposite
   # direction is allowed. Wins, break-even scratches (break-even already moved), manual positions and
@@ -35,7 +57,7 @@ risk:
   cooldown_hours: 4
   # At most one new position per executor run.
   one_new_open_per_run: true
-  # Worst case: max_open x risk_per_trade_pct of equity at risk at once (4 x 5% = 20%), plus slippage.
+  # Worst case: risk_caps.total_pct of equity at risk at once (20%), plus slippage beyond the buffers.
 
 # ---------------------------------------------------------------------------
 # Fees
@@ -49,6 +71,10 @@ fees:
   # A buffer, not a cap: a worse stop fill can still lose more, and the hard cut cannot catch slippage
   # inside the exchange's own stop fill. Measure your own fills and adjust.
   slip_frac: 0.0018
+  # Expected adverse MARKET-ENTRY fill vs the quote, fraction of entry. Added to the planned stop-out loss in
+  # sizing (not in the hard cut, which uses the real average price). Default = slip_frac as a conservative
+  # estimate until you have entry-fill data. The fee_heavy share keeps the old denominator (without this term).
+  entry_slip_frac: 0.0018
 
 # ---------------------------------------------------------------------------
 # Bot identity and manual trades
@@ -61,6 +87,10 @@ bot:
   #       Manual positions only get a missing-stop alert.
   # false: manual positions are managed like bot positions.
   protect_manual_trades: true
+  # true: a position with no bot_positions.json record whose opening order in the exchange history carries the
+  # bot prefix (filled, not reduce-only, within 120 s of the position) is adopted: manage.py rebuilds its record
+  # (entry = average price, stop / target = the live TP/SL). An existing record on the pair is never overwritten.
+  adopt_from_history: true
 
 # ---------------------------------------------------------------------------
 # Entry filters
@@ -100,6 +130,9 @@ entry:
   # Open positions are never touched.
   stock_perp_block:
     enabled: true
+  # Skip any entry (either side) on a pair that still holds an unresolved bot record: a bot_positions.json
+  # record with no matching live position, or a pruned record whose close line was not found yet.
+  unresolved_record_block: true
 
 # ---------------------------------------------------------------------------
 # Setup scanner (scripts/scan.py)
@@ -109,6 +142,13 @@ scan:
   # quote volume. Stock perps are then blocked by entry.stock_perp_block; commodities and forex are
   # allowed and tagged (asset_class)...
   universe_size: 25
+  # Extended universe: rank by volume up to universe_ext_size. Ranks 1..universe_size are tier "core" (rules
+  # unchanged); ranks universe_size+1..universe_ext_size are tier "ext" and ALSO need a fresh news-analyst rating
+  # (fundamentals.json, younger than news_gate.fresh_hours) or are skipped as no_fundamentals (fails closed).
+  # The rank is computed once per scan (before the spread filter) and stored in scan.json (vol_ranks,
+  # vol_rank, universe_tier). false: universe_size only.
+  universe_ext_enabled: true
+  universe_ext_size: 40
   # ...then drop pairs whose bid/ask spread is wider than this percent of last price.
   max_spread_pct: 0.1
   # Stop = the further of (swing low/high of the last N 1H candles -/+ buffer * ATR)
@@ -199,7 +239,7 @@ scanner:
 shadow_swap:
   hurdle_mult: 1.2           # candidate EV must beat (remaining profit + close fee) x this
   rr_edge: 0.5               # and candidate R:R must beat old R:R + this
-  max_age_min: 60            # ignore scan setups older than this
+  max_age_min: 35            # ignore scan setups older than this (= entry.max_scan_age_min)
   slots: [9, 24, 39, 54]     # minutes past the hour for the built-in scheduler
 
 # ---------------------------------------------------------------------------
@@ -214,6 +254,13 @@ logging:
   # manage.py appends one run record per invocation to data/runs.json (run_id printed in its output);
   # the agent attaches its own fields with scripts/runlog.py annotate.
   run_records: true
+  # Every executor skip becomes a blocked_setups line (gate_reason from the skip reason), not only news /
+  # 1h / stock-perp / sizing gates.
+  log_all_skips: true
+  # A --dry run whose RUN_ID names a manage.py run record (runs.json) written within this many seconds is the
+  # scheduled routine's decision run: its block lines go to the LIVE log with mode "scheduled_dry". Ad-hoc dry
+  # runs stay in the dry log. Logging only.
+  scheduled_dry_window_s: 1800
 
 # ---------------------------------------------------------------------------
 # Shadow filter variants (scripts/shadow_variants.py, read-only, never trades)
@@ -223,7 +270,9 @@ logging:
 # rules without the 1h gate), V_1H (1h gate always on), V_ATR15 (stop widened to >= atr_widen x ATR),
 # V_RR10 (skip setups with R:R >= rr_cap), STOCKS_ONLY (stock perps only), V_SLOWTREND (time-series
 # momentum z over 168h/720h must agree with the side, |z| > slowtrend_z_min), V_CROWD (no longs in the
-# crowd_n pairs with the highest average funding over crowd_hours, no shorts in the crowd_n lowest).
+# crowd_n pairs with the highest average funding over crowd_hours, no shorts in the crowd_n lowest), V_RR2
+# (live rules but gross min R:R rr2_min; also walks the scan's rejected rr2_min <= R:R < min_rr setups, rebuilt
+# with the scan geometry; rows tagged rr_bucket). Every book follows the live universe tiers, risk caps and sizing.
 shadow_variants:
   enabled: true
   poll_sec: 20
@@ -232,3 +281,4 @@ shadow_variants:
   slowtrend_z_min: 1.0
   crowd_n: 2
   crowd_hours: 72
+  rr2_min: 2.0

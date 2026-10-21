@@ -27,7 +27,7 @@ Use the scripts for every order. Do not write order bodies or call order endpoin
 | `python3 scripts/news_gate.py PAIR SIDE` | `{"block": true/false, "reason": ...}`. For your report only; `execute.py` runs the same check itself. |
 | `python3 scripts/scan.py` | Refreshes `scan.json`. |
 | `python3 scripts/execute.py [--inst PAIR]` | Checks setups best-first and opens at most one trade. |
-| `python3 scripts/execute.py --dry` | Same checks, prints the plan, places nothing. Its blocks go to the dry log only. |
+| `python3 scripts/execute.py --dry` | Same checks, prints the plan, places nothing. Its blocks go to the dry log only, unless RUN_ID is this cycle's manage.py run_id (the scheduled decision run): then they go to the live log as `scheduled_dry`. |
 | `python3 scripts/runlog.py annotate --run-id ID --json '{...}'` | Attach your run notes to the run record `manage.py` wrote (its `run_id`). Do not hand-write run records. |
 | `python3 scripts/blocklog.py add ...` | Log a setup you blocked yourself. `execute.py` logs its own blocks. |
 | `python3 scripts/transfers.py detect --since ISO` | Lists deposits/withdrawals not yet logged. Equity changes from transfers are not PnL. |

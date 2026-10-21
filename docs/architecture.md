@@ -63,6 +63,8 @@ flowchart LR
 | `scripts/execute.py` | script | `scan.json`, account | `exec_last.json`, `bot_positions.json` | yes, at most one per run |
 | `scripts/manage.py` | script | account, `bot_positions.json` | `bot_positions.json` | stops, break-even, closes |
 | `scripts/news_gate.py` | script | `fundamentals.json` | nothing | no |
+| `scripts/universe.py` | helper | config, `fundamentals.json` | nothing | no |
+| `scripts/riskcap.py` | helper | positions + TP/SL passed in | nothing | no |
 | `scripts/shadow_swap.py` | script | `scan.json`, `state.json`, account (GET) | `logs/shadow_swap.*` | never |
 | Executor | agent | all of the above | `state.json` | yes, via `execute.py` and `manage.py` |
 | News analyst | agent | `scan.json` universe, the web | `fundamentals.json` | no |

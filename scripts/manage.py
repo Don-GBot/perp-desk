@@ -25,6 +25,10 @@ Bot vs manual positions: a position is the bot's if
   (b) the exchange order history has a FILLED, non-reduce-only opening order on that side whose
       clientOrderId starts with bot.client_order_prefix, created within 120 s of the position.
 Only values from a matching record (initial_stop, target, stop_dist, equity_at_entry) are ever used.
+With bot.adopt_from_history (default true), every run (under the lock, after the prune) rebuilds the missing record of a
+(b) position: entry = average price, initial stop / target = the live TP/SL, recorded_by "manage.py (rebuilt from order
+history)", so it gets full bot treatment and counts in the caps. An existing record on the pair is never overwritten
+(registry.put refuses). A history read failure leaves the position manual (its stop is still alerted on).
 With bot.protect_manual_trades: true (default), the hard cut, break-even, tighten and close only act
 on bot positions; manual positions only get a missing-stop alert. `close --force` overrides for a human.
 
@@ -42,7 +46,7 @@ Endpoints (Blofin public API docs):
   POST /api/v1/trade/order-tpsl       {instId, marginMode, positionSide, side, slTriggerPrice, slOrderPrice: "-1", tp..., size: "-1", reduceOnly}
   POST /api/v1/trade/order-algo       trailing stop, see execute.trail_body
 """
-import os, sys, json, argparse
+import os, sys, json, argparse, datetime as dt
 from decimal import ROUND_DOWN, ROUND_UP
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
@@ -106,6 +110,29 @@ def owner(p, reg=None):
 
 def is_bot_position(p, reg=None):
     return owner(p, reg)[0]
+
+ADOPT = bool(C["bot"].get("adopt_from_history", True))
+
+def adopt_from_history(pos, reg):
+    """Rebuild bot_positions.json records for live positions with no record whose opening order in the exchange history
+    is the bot's (history_says_bot). Never overwrites a record. Returns (adopted instIds, notes). Never raises."""
+    adopted, notes = [], []
+    if not ADOPT: return adopted, notes
+    for p in pos:
+        inst = p.get('instId')
+        try:
+            if registry.match(p, reg) or not history_says_bot(p): continue
+            if inst in reg: notes.append(f'{inst}: bot position (order history) but another record holds the pair: not overwritten'); continue
+            tp = pending_tpsl(inst); sl = _stop_of(tp); avg = float(p['averagePrice']); ct = int(p.get('createTime') or 0)
+            rec = dict(instId=inst, side='buy' if is_long(p) else 'sell', clientOrderId=None,
+                       opened_at=dt.datetime.fromtimestamp(ct / 1000, dt.timezone.utc).isoformat() if ct else None,
+                       position_createTime=p.get('createTime'), positionId=p.get('positionId'), avg=avg, entry_quote=avg,
+                       initial_stop=sl, target=_tp_of(tp), stop_dist=abs(avg - sl) if sl else None, equity_at_entry=None,
+                       be_done=False, recorded_by='manage.py (rebuilt from order history)',
+                       rebuilt_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            registry.put(rec); reg[inst] = rec; adopted.append(inst)
+        except Exception as e: notes.append(f'{inst}: history adoption failed ({str(e)[:120]}): kept as is')
+    return adopted, notes
 
 def _stop_of(tpsl_list):
     s = [float(t['slTriggerPrice']) for t in tpsl_list if t.get('slTriggerPrice') not in (None, '', '0')]
@@ -411,12 +438,14 @@ def main():
         if a.cmd == 'status':
             try:
                 with lock.exclusive():
-                    reg, removed = registry.prune_full(positions()); pruned = sorted(removed); book = bookkeeping(removed, reg)
-            except lock.LockBusy: reg, pruned = registry.load(), []
+                    pos = positions(); reg, removed = registry.prune_full(pos); pruned = sorted(removed); book = bookkeeping(removed, reg)
+                    adopted = adopt_from_history(pos, reg)
+            except lock.LockBusy: reg, pruned, adopted = registry.load(), [], ([], [])
             res = status(reg); res['pruned_records'] = pruned
         else:
             with lock.exclusive():
-                reg, removed = registry.prune_full(positions()); pruned = sorted(removed); book = bookkeeping(removed, reg)
+                pos = positions(); reg, removed = registry.prune_full(pos); pruned = sorted(removed); book = bookkeeping(removed, reg)
+                adopted = adopt_from_history(pos, reg)
                 actions = {
                     'ensure-stops': lambda: ensure_stops(reg),
                     'hard-cut': lambda: hard_cut(reg),
@@ -427,6 +456,8 @@ def main():
                     'cancel-trail': lambda: cancel_trail(a.inst),
                 }
                 res = actions[a.cmd](); res['pruned_records'] = pruned
+        if adopted[0]: res['adopted_from_history'] = adopted[0]
+        if adopted[1]: res['adoption_notes'] = adopted[1]
     except lock.LockBusy as e: res = dict(ok=False, why=str(e))
     except Exception as e: res = dict(ok=False, why=f'error: {str(e)[:300]}')
     if book: res['bookkeeping'] = book

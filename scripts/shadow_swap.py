@@ -7,6 +7,7 @@ Only GET endpoints are called (positions, balance, tpsl-pending, tickers, instru
 
   python3 scripts/shadow_swap.py --once    # one cycle, then exit (use this from cron)
   python3 scripts/shadow_swap.py           # built-in scheduler, cycles at shadow_swap.slots minutes
+  python3 scripts/shadow_swap.py --stats [--by universe_tier]   # decision counts (read-only)
 
 Needs BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE (read-only use) and exits if they are missing.
 
@@ -35,8 +36,11 @@ run code with __name__ == "__main__"):
   3. stop distance >= min_stop_atr * atr_tolerance * 1H ATR
   4. 4H trend aligned (scan.py rule)
   5. not a stock perp (entry.stock_perp_block), no re-entry cooldown, 1H trend aligned (entry.trend_1h), same functions as execute.py
-  6. size >= minSize and a margin fit (leverage range, margin cap incl. margin freed by closing the
-     old trade, liquidation well beyond the stop).
+  6. universe tier: an 'ext' candidate needs a fresh news-analyst rating (universe.py), else FILTERED "NO_FUNDAMENTALS"
+  7. sizing exactly as execute.py (execute.fit_size: scaled down to the binding limit incl. the risk-cap headroom from
+     execute.risk_assess on the live positions, skip fee_heavy / below_min_size / liq / cap_risk), with the margin cap
+     incl. margin freed by closing the old trade; liquidation well beyond the stop.
+  Records carry universe_tier; `--stats [--by universe_tier]` counts decisions.
   Failures are logged once per cycle as FILTERED. Margin fit is re-checked per pair.
 """
 import os, sys, json, time, math, logging, argparse, datetime as dt
@@ -49,6 +53,7 @@ def _load_json(path):
     with open(path) as fh:
         return json.load(fh)
 import execute as EX          # safe: execute.py only acts under __main__; we use pure helpers only
+import universe as UN
 from scan import candles, atr, trend, rr as price_rr, net_rr
 
 SC = config.CFG["shadow_swap"]
@@ -111,14 +116,17 @@ def trend4h(inst):
     return trend([x[3] for x in candles(inst, config.CFG["entry"]["trend_filter"]["timeframe"])])
 
 def margin_fit(c, equity, free, freed):
-    """execute.run sizing/leverage/liq logic; cap = min(25% equity, 95% free + freed)."""
+    """execute.py sizing/leverage/liq logic (execute.fit_size); cap = min(25% equity, 95% free + freed)."""
     avail_eff = free + freed / EX.FREE_BUF
-    lev, cap = EX.pick_lev(c["_notional"], equity, avail_eff, c["_maxlev"])
-    m = dict(freed=round(freed, 4), cap=round(cap, 4), notional=round(c["_notional"], 4), size=c["_size"])
-    if lev is None:
-        return False, dict(m, ok=False, why=f"no leverage {EX.LEVMIN}-{int(min(EX.LEVMAX, c['_maxlev']))}x fits: margin@max {c['_notional']/min(EX.LEVMAX, c['_maxlev']):.2f} > cap {cap:.2f}")
+    sz = EX.fit_size(equity, avail_eff, c["_entry"], c["stop"], c["_cv"], c["_lot"], c["_mins"], c["_maxlev"], c["_mmr"], c.get("_risk_cap"))
+    lev, cap, notional = sz["lev"], sz["cap"], sz["notional"]
+    m = dict(freed=round(freed, 4), cap=round(cap, 4) if cap is not None else None, notional=round(notional, 4), size=sz["size"],
+             scaled_down=sz["scaled_down"], risk_pct_actual=sz["risk_pct_actual"], fee_share=sz["fee_share"],
+             ev_scaled=round(c["ev"] * sz["size"] / c["_size"], 4) if sz["scaled_down"] and c.get("_size") else None)
+    if sz["gate"]:
+        return False, dict(m, ok=False, gate=sz["gate"], why=sz["why"])
     liq = EX.est_liq(c["_entry"], c["_eside"], lev, c["_mmr"]); ld = abs(liq - c["_entry"])
-    m.update(lev=lev, margin=round(c["_notional"] / lev, 4), liq_est=liq, liq_dist=ld, stop_dist=c["_risk"],
+    m.update(lev=lev, margin=round(notional / lev, 4), liq_est=liq, liq_dist=ld, stop_dist=c["_risk"],
              liq_mult=round(ld / c["_risk"], 3) if c["_risk"] else None)
     if c["_risk"] >= EX.MAX_STOP_TO_LIQ * ld:
         return False, dict(m, ok=False, why=f"liq {liq:.8g} too close at {lev}x: stop dist {c['_risk']:.8g} >= {EX.MAX_STOP_TO_LIQ:g} x liq dist {ld:.8g}")
@@ -161,13 +169,17 @@ def entry_filters(c, ins, tk, equity, risk_usdt, now_dt):
     tw, t1d = EX.trend1h_check(i, eside)                    # mirrors execute.py entry.trend_1h
     flt["trend1h"] = t1d
     if tw: flt["failed"].append("TREND1H"); why.append(tw)
+    uw = UN.block_reason(c, now=now_dt)                     # mirrors execute.py universe tiers (fail closed)
+    flt["universe_tier"] = UN.tier_of(c)
+    if uw: flt["failed"].append("NO_FUNDAMENTALS"); why.append(uw)
     size = EX.size_for(equity, px, stop, cv, lot) if rd > 0 else 0.0
     flt.update(size=size, min_size=mins)
     if size < mins: flt["failed"].append("MINSIZE"); why.append(f"size {size:g} < min {mins:g}")
     notional = risk_usdt / rd * px if rd > 0 else 0.0
     ev = risk_usdt * rr_n   # EV uses net R:R (round-trip taker fees included)
     cd = dict(base, live=px, stop=stop, target=target, rr_live=round(rr, 3), ev=round(ev, 4), open_fee=round(notional * FEE, 4),
-              _entry=px, _eside=eside, _risk=rd, _notional=size * cv * px, _size=size,
+              _entry=px, _eside=eside, _risk=rd, _notional=size * cv * px, _size=size, _cv=cv, _lot=lot, _mins=mins,
+              _risk_cap=c.get("_risk_cap"), universe_tier=UN.tier_of(c),
               _maxlev=f(meta.get("maxLeverage")) or EX.LEVMAX, _mmr=f(meta.get("maintenanceMarginRate")) or EX.MMR_DEFAULT)
     return cd, flt, "; ".join(why)
 
@@ -176,13 +188,14 @@ def pub_c(c): return {k: v for k, v in c.items() if not k.startswith("_")}
 def cycle():
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     ins = {i["instId"]: i for i in pub("/api/v1/market/instruments")}
-    tpsl = {}
+    tpsl = {}; tpsl_rows = []; tpsl_full = False
     bal = priv("/api/v1/account/balance")
     usdt = [d for d in bal.get("details", []) if d.get("currency") == "USDT"]
     equity = f(usdt[0]["equity"]) if usdt else f(bal.get("totalEquity"))
     pos = [p for p in priv("/api/v1/account/positions") if f(p.get("positions"), 0) != 0]
     for p in pos:   # one request per open pair, so a long pending list can't be cut off at the page size
         lst = priv("/api/v1/trade/orders-tpsl-pending", {"instId": p["instId"], "limit": 100}) or []
+        tpsl_rows += lst; tpsl_full = tpsl_full or len(lst) >= 100   # a full page may be incomplete -> risk caps fall back
         withsl = [t for t in lst if f(t.get("slTriggerPrice"))]
         if lst: tpsl[p["instId"]] = (withsl or lst)[0]
     risk_usdt = RISK * equity
@@ -227,12 +240,20 @@ def cycle():
                 f"cand={rec.get('candidate',{}).get('instId') if rec.get('candidate') else '-'} "
                 f"oldRR={rec.get('old_rr')} candRR={rec.get('cand_rr')} oldEV={rec.get('old_ev')} "
                 f"candEV={rec.get('cand_ev')} hurdle={rec.get('hurdle')} :: {rec['reason']}")
+    rcache = {}
+    def risk_cap(side):   # mirror execute.py risk caps on the live positions (read-only, no order-history lookups)
+        if side not in rcache:
+            if tpsl_full: rcache[side] = dict(mode="slots", error="tpsl-pending page full (100), may be incomplete")
+            else: rcache[side] = EX.risk_assess(side, pos, equity, tpsl_rows, {k: f(v.get("contractValue"), 1.0) for k, v in ins.items()}, history=False)
+        return rcache[side]
     cands, seen, nseen, nfilt = [], set(), 0, 0
     for c in load_cands():
         i = c.get("instId")
         if not i or i in openset or i in seen:
             continue
         seen.add(i); nseen += 1
+        rca = risk_cap("buy" if c.get("side") in ("buy", "long") else "sell")
+        c = dict(c, _risk_cap=rca.get("headroom") if rca.get("mode") == "risk" else None)
         try:
             cd, flt, why = entry_filters(c, ins, tk, equity, risk_usdt, now_dt)
             if not why:
@@ -301,8 +322,23 @@ def next_slot(now):
             t = base.replace(minute=m) + dt.timedelta(hours=h)
             if t > now: return t
 
+def stats(path=None, by=None):
+    """Decision counts from shadow_swap.jsonl, optionally split by universe_tier (records without one: 'untagged')."""
+    out = {}
+    try: fh = open(path or os.path.join(L, "shadow_swap.jsonl"))
+    except FileNotFoundError: return out
+    with fh:
+        for x in fh:
+            try: r = json.loads(x)
+            except Exception: continue
+            k = ((r.get("candidate") or {}).get("universe_tier") or "untagged") if by == "universe_tier" else "all"
+            d = out.setdefault(k, {}); d[r.get("decision")] = d.get(r.get("decision"), 0) + 1
+    return out
+
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--once", action="store_true"); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--once", action="store_true"); ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--by", choices=["universe_tier"]); a = ap.parse_args()
+    if a.stats: print(json.dumps(stats(by=a.by), indent=1)); return
     bf.require_keys("shadow_swap.py")
     if a.once:
         cycle(); return

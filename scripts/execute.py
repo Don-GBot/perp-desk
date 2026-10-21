@@ -9,20 +9,27 @@ Needs BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE. Holds DATA_DIR/exe
 
 Per run:
   - Reject the whole scan if scan.json is older than entry.max_scan_age_min.
-  - Account checks once: equity readable, overall cap, account in net (one-way) mode.
+  - Account checks once: equity readable, max positions (risk_caps.max_positions), account in net (one-way) mode.
   - For each setup in order (best R:R first), skip it with a reason if any check fails, then try the next:
-    side valid; direction cap; no position on the pair; stop/target rounded to tick and
+    side valid; no position on the pair; not a stock perp (entry.stock_perp_block, stockperp.py; fails closed);
+    universe tier: an 'ext' setup (volume rank beyond scan.universe_size) needs a fresh news-analyst rating, else
+    no_fundamentals (universe.py; fails closed); re-entry cooldown; caps (risk caps, or the slot caps as fallback);
+    no unresolved bot record on the pair (entry.unresolved_record_block); stop/target rounded to tick and
     stop < entry < target (long) or target < entry < stop (short) at the live price;
-    not a stock perp (entry.stock_perp_block, stockperp.py; checked first, fails closed);
     R:R (price-only: (target - entry) / (entry - stop)) >= min_rr; stop >= ATR floor; 4H trend re-checked now;
     1H trend aligned with the side (entry.trend_1h, trend1h.py; flat blocks both sides, a data error skips);
-    size >= instrument min; a leverage in [min, max] that fits the margin cap; liquidation well beyond the stop.
+    sizing (fit_size): scaled down to the binding limit, skip fee_heavy / below_min_size / liq / cap_risk.
   - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop.
-Sizing: a clean stop-out loses about risk_per_trade_pct of equity INCLUDING entry and exit taker fees and a slippage
-buffer (fees.slip_frac x entry): loss per coin = |entry - stop| + taker_rate x (entry + stop) + slip_frac x entry.
-Direction cap: max_per_direction counts open BOT positions only (bot_positions.json matches); manual positions count
-toward max_open only. Re-entry cooldown: no entry on a pair+side within risk.cooldown_hours of a losing bot stop /
-trail / hard-cut close (closes.cooldown_check). Either check failing to read is a skip, never a pass.
+Sizing: risk_per_trade_pct is a MAXIMUM. A clean stop-out of a planned entry loses about risk_per_trade_pct of equity
+INCLUDING entry slippage, entry and exit taker fees and an exit slippage buffer: loss per coin = |entry - stop| +
+entry_slip_frac x entry + taker_rate x (entry + stop) + slip_frac x entry. With risk.scale_down the size is then cut
+(never raised) to fit leverage.max / the instrument max, the margin cap (25% equity, 95% free margin), the highest
+leverage whose estimated liquidation is > 2x the stop distance, and the risk-cap headroom (fit_size).
+Caps (risk.risk_caps, riskcap.py): total open risk + new <= total_pct of equity, same-direction bot open risk + new <=
+direction_pct, max_positions open positions. If any position's risk can't be computed, the slot caps apply
+(max_open overall, max_per_direction bot positions per side). Re-entry cooldown: no entry on a pair+side within
+risk.cooldown_hours of a losing bot stop / trail / hard-cut close (closes.cooldown_check). Any check failing to read is
+a skip, never a pass.
 
 Once an order is accepted the result is ok:true, written to DATA_DIR/exec_last.json right away, and any
 later problem (position not visible yet, trailing stop rejected) is reported under "warnings".
@@ -32,8 +39,10 @@ The news gate (news_gate.check) and, when enabled, the macro window (news_gate.m
 applied inside evaluate() to every candidate, so falling through to the next setup can never open a
 news-blocked trade.
 
-Every news-gate, 1h-trend and stock-perp block is logged to DATA_DIR/blocked_setups.jsonl (blocklog.py, source
-"execute"); --dry lines go to DATA_DIR/logs/blocked_setups_dry.jsonl. A log failure only adds a warning.
+Every skip is logged to DATA_DIR/blocked_setups.jsonl (blocklog.py, source "execute"; with logging.log_all_skips,
+otherwise only the news / 1h / stock-perp / universe / sizing gates); --dry lines go to
+DATA_DIR/logs/blocked_setups_dry.jsonl, except the scheduled routine's dry decision run (mode "scheduled_dry", live
+file; blocklog.scheduled_dry). A log failure only adds a warning.
 
 If the order request times out or the connection drops, the script looks the order up by its
 clientOrderId (and checks positions) before deciding it failed.
@@ -44,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
 import config, lock, registry, news_gate
 import trend1h as T1, stockperp as SP, blocklog as BL, closes
+import universe as UN, riskcap as RC
 
 def _load_json(path):
     with open(path) as fh:
@@ -52,7 +62,9 @@ from scan import candles, atr, trend, rr as price_rr, net_rr
 
 C = config.CFG; R_ = C["risk"]; E = C["entry"]; LV = C["leverage"]; M = C["management"]
 RISK = R_["risk_per_trade_pct"] / 100.0
-FEE = float(C["fees"]["taker_rate"]); SLIP = float(C["fees"]["slip_frac"])
+FEE = float(C["fees"]["taker_rate"]); SLIP = float(C["fees"]["slip_frac"]); ENTRY_SLIP = float(C["fees"]["entry_slip_frac"])
+SCALE_DOWN = bool(R_["scale_down"]); FEE_HEAVY_MAX = float(R_["fee_heavy_max_share"])
+UNRES_BLOCK = bool(E["unresolved_record_block"]); LOG_ALL_SKIPS = bool(C["logging"]["log_all_skips"])
 COOLDOWN_H = float(R_["cooldown_hours"])
 PREFIX = C["bot"]["client_order_prefix"]
 MAXDIR = int(R_["max_per_direction"]); MAXALL = int(R_["max_open"]); MINRR = float(E["min_rr"])
@@ -82,17 +94,76 @@ def est_liq(entry, side, L, mmr=MMR_DEFAULT):
     # isolated liq estimate: long = entry*(1-1/L+mmr), short = entry*(1+1/L-mmr) (fees ignored)
     d = entry * (1.0 / L - mmr); return entry + d if side == 'sell' else entry - d
 
-def risk_per_coin(entry, stop, fee=FEE, slip=SLIP):
-    """Loss of one coin at the stop: price distance + taker fee on entry and exit + slippage buffer."""
-    return abs(entry - stop) + fee * (entry + stop) + slip * entry
+def risk_per_coin(entry, stop, fee=FEE, slip=SLIP, entry_slip=0.0):
+    """Loss of one coin at the stop: price distance + taker fee on entry and exit + exit slippage buffer
+    (+ entry slippage for a planned entry, see planned_risk_per_coin)."""
+    return abs(entry - stop) + entry_slip * entry + fee * (entry + stop) + slip * entry
 
-def loss_per_contract(entry, stop, cv, fee=FEE, slip=SLIP):
-    """Loss of one contract at the stop, including entry and exit taker fees and the slippage buffer."""
-    return cv * risk_per_coin(entry, stop, fee, slip)
+def planned_risk_per_coin(entry, stop):
+    """Loss of one coin of a PLANNED market entry at the quote, stopped out: adds fees.entry_slip_frac x entry."""
+    return risk_per_coin(entry, stop, FEE, SLIP, ENTRY_SLIP)
+
+def loss_per_contract(entry, stop, cv, fee=FEE, slip=SLIP, entry_slip=None):
+    """Loss of one contract of a planned entry at the stop, incl. entry slippage, taker fees and the exit slippage buffer."""
+    return cv * risk_per_coin(entry, stop, fee, slip, ENTRY_SLIP if entry_slip is None else entry_slip)
 
 def size_for(equity, entry, stop, cv, lot, fee=FEE, slip=SLIP):
+    """The full-risk (risk_per_trade_pct) size in contracts, lot-rounded DOWN."""
     per = loss_per_contract(entry, stop, cv, fee, slip)
     return float(q((equity * RISK) / per, lot, ROUND_DOWN)) if per > 0 else 0.0
+
+def fee_share(entry, stop):
+    """Round-trip taker fees / stop-out loss, per coin (size cancels). The denominator deliberately leaves out the
+    entry-slip term (|entry - stop| + taker x (entry + stop) + slip_frac x entry)."""
+    return FEE * (entry + stop) / risk_per_coin(entry, stop)
+
+def lev_liq_max(entry, stop, mmr=MMR_DEFAULT, maxlev=LEVMAX):
+    """Highest L in [min, min(max, maxlev)] whose estimated liq distance entry x (1/L - mmr) is beyond the stop distance
+    by 1 / max_stop_to_liq (2x by default); None if none."""
+    d = abs(entry - stop)
+    ok = [L for L in range(LEVMIN, int(min(LEVMAX, maxlev)) + 1) if d < MAX_STOP_TO_LIQ * entry * (1.0 / L - mmr)]
+    return max(ok) if ok else None
+
+def fit_size(equity, avail, entry, stop, cv, lot, mins, maxlev=LEVMAX, mmr=MMR_DEFAULT, risk_cap=None):
+    """Shared sizing (execute, shadow_variants, shadow_swap). Returns dict(size, size_full, lev, cap, notional, scaled_down,
+    scaled_by, risk_pct_actual, fee_share, gate, why). gate None = may proceed, else 'below_min_size' | 'no_leverage_fit' |
+    'fee_heavy' | 'liq' | 'cap_risk'. Start: the full-risk size (size_for). Scale DOWN only, lot-rounded:
+      1. risk_cap (USDT, risk-cap headroom): size <= risk_cap / (planned loss per contract); below min -> cap_risk
+      2. leverage: L <= min(leverage.max, maxlev, lev_liq_max); none -> liq
+      3. margin: lowest L whose margin fits min(margin_cap, free margin buffer) (pick_lev); if none, the size that fits at
+         the highest allowed L
+    A scaled size is skipped if fee_share > fee_heavy_max_share (fee_heavy) or < minSize (below_min_size).
+    risk.scale_down false -> no scaling: no_leverage_fit skip (the liq check then runs in evaluate)."""
+    size = size_for(equity, entry, stop, cv, lot); fsh = fee_share(entry, stop)
+    out = dict(size=size, size_full=size, lev=None, cap=None, notional=size * cv * entry, scaled_down=False, scaled_by=[],
+               fee_share=round(fsh, 4), risk_pct_actual=None, gate=None, why=None)
+    if size < mins: out.update(gate='below_min_size', why=f'size {size:g} below min {mins:g}'); return out
+    if risk_cap is not None:
+        per = loss_per_contract(entry, stop, cv)
+        rc = float(q(max(0.0, risk_cap) / per, lot, ROUND_DOWN)) if per > 0 else 0.0
+        if rc < size:
+            out.update(size=rc, notional=rc * cv * entry, scaled_down=True); out['scaled_by'].append('cap_risk')
+            if rc < mins or rc <= 0:
+                out.update(gate='cap_risk', why=f'cap_risk: risk headroom {max(0.0, risk_cap):.2f} USDT fits {rc:g} < min {mins:g} (full size {size:g})'); return out
+    Lmax = int(min(LEVMAX, maxlev))
+    if SCALE_DOWN:
+        Lliq = lev_liq_max(entry, stop, mmr, maxlev)
+        if Lliq is None: out.update(gate='liq', why=f'liq too close at every leverage >= {LEVMIN}x: stop dist {abs(entry-stop):.8g}'); return out
+        Lmax = min(Lmax, Lliq)
+    L, cap = pick_lev(out['notional'], equity, avail, Lmax); out['cap'] = cap
+    if L is None:
+        if not SCALE_DOWN or cap <= 0:
+            out.update(gate='no_leverage_fit', why=f"no leverage <= {Lmax} fits: notional {out['notional']:.2f}, margin cap {cap:.2f}"); return out
+        s2 = min(out['size'], float(q(cap * Lmax / (cv * entry), lot, ROUND_DOWN)))
+        out.update(size=s2, notional=s2 * cv * entry, scaled_down=True); out['scaled_by'].append('margin'); L = Lmax
+    if out['scaled_down']:
+        if fsh > FEE_HEAVY_MAX:
+            out.update(gate='fee_heavy', why=f"fee_heavy: round-trip fees {fsh*100:.1f}% of stop-out loss > {FEE_HEAVY_MAX*100:.1f}% (scaled size {out['size']:g} at {L}x)"); return out
+        if out['size'] < mins or out['size'] <= 0:
+            out.update(gate='below_min_size', why=f"below_min_size: scaled size {out['size']:g} < min {mins:g} (full size {size:g})"); return out
+    out['lev'] = L
+    out['risk_pct_actual'] = round(out['size'] * loss_per_contract(entry, stop, cv) / equity * 100, 3) if equity else None
+    return out
 
 def norm_side(s):
     return SIDES.get(str(s).strip().lower())
@@ -155,15 +226,75 @@ def trend1h_check(inst, side, rows=None):
     return (None, d) if t == T1.want(side) else (f'1h_trend ({t})', d)
 
 def log_block(setup, gate_reason, reason, ctx, extra=None):
-    """Append one blocked_setups line. Never raises: a failure becomes a warning in ctx."""
+    """Append one blocked_setups line (at most one per setup per run). Never raises: a failure becomes a warning in ctx."""
     if not BL.ENABLED: return
+    key = (setup.get('instId'), setup.get('side'), setup.get('_rank'))
+    logged = ctx.setdefault('_logged', set())
+    if key in logged: return
+    logged.add(key)
     try:
         side = norm_side(setup.get('side'))
-        line = BL.build_line('execute', 'dry' if ctx.get('dry') else 'live', setup.get('instId'), 'long' if side == 'buy' else 'short',
+        line = BL.build_line('execute', BL.mode_for(ctx.get('dry')), setup.get('instId'), 'long' if side == 'buy' else 'short',
                              setup.get('entry'), setup.get('stop'), setup.get('target'), setup.get('rr'), setup.get('_rank'),
-                             gate_reason, run_id=os.environ.get('RUN_ID'), scan_ts=ctx.get('scan_ts'), reason=reason, **(extra or {}))
+                             gate_reason, run_id=os.environ.get('RUN_ID'), scan_ts=ctx.get('scan_ts'), reason=reason,
+                             universe_tier=UN.tier_of(setup), vol_rank=setup.get('vol_rank'), **(extra or {}))
         BL.append(line)
     except Exception as e: ctx.setdefault('warnings', []).append(f'blocked_setups log failed: {str(e)[:160]}')
+
+GATES = (('unresolved', 'unresolved_record'), ('cooldown', 'cooldown'), ('max positions', 'max_positions'),
+         ('overall cap', 'overall_cap'), ('direction cap', 'dir_cap'), ('already has a position', 'duplicate'),
+         ('existing position', 'duplicate'), ('r:r', 'rr'), ('atr', 'atr'), ('trend now', 'trend'), ('news gate', 'news_gate'),
+         ('macro', 'macro_window'), ('instrument', 'instrument'), ('needs stop', 'geometry'), ('needs target', 'geometry'),
+         ('bad setup', 'bad_setup'), ('leverage', 'leverage'), ('error', 'error'))
+
+def gate_of(why):
+    """gate_reason for a skip that carries no explicit one."""
+    w = str(why or '').lower()
+    for k, g in GATES:
+        if k in w: return g
+    return 'other'
+
+def universe_block(setup, ctx, now=None):
+    """None, or the SKIP reason 'no_fundamentals (...)' for an 'ext' tier setup without a fresh rating (logged)."""
+    why = UN.block_reason(setup, now=now)
+    if why: log_block(setup, 'no_fundamentals', why, ctx)
+    return why
+
+def unresolved_block(inst, pos):
+    if not UNRES_BLOCK: return None
+    try: return registry.unresolved(inst, pos)
+    except Exception as e: return f'unresolved_record check error: {str(e)[:160]}'
+
+# ---- risk caps ---------------------------------------------------------------------------------
+def risk_assess(side, pos, equity, tpsl_rows=None, cvm=None, history=True, reg=None):
+    """riskcap.assess on live data: pending TP/SL (one page of 100, a full page counts as incomplete), contract values,
+    bot ownership as for the direction cap (registry match, else order history when history=True). Any read error ->
+    mode 'slots' (fail closed)."""
+    try:
+        if not RC.ENABLED: raise ValueError('risk_caps disabled')
+        if tpsl_rows is None:
+            tp = bf.private('GET', '/api/v1/trade/orders-tpsl-pending', {'limit': 100})
+            if not bf.resp_ok(tp): raise ValueError('tpsl-pending read failed')
+            tpsl_rows = tp.get('data') or []
+        rows = list(tpsl_rows)
+        if len(rows) >= 100: raise ValueError('tpsl-pending page full (100), may be incomplete')
+        if cvm is None: cvm = {k: float(v['contractValue']) for k, v in instruments().items()}
+        reg = registry.load_strict() if reg is None else reg
+        import manage   # lazy: manage imports this module
+        isb = lambda p: bool(registry.match(p, reg)) or (history and manage.history_says_bot(p))
+        brec = lambda i: isinstance(reg.get(i), dict)
+        return RC.assess(side, pos, rows, lambda i: cvm[i], equity, isb, FEE, SLIP, brec)
+    except Exception as e: return dict(mode='slots', error=f'{type(e).__name__}: {str(e)[:160]}')
+
+def cap_check(side, ctx):
+    """(reason or None, assessment). Risk caps when computable (the new trade is scaled to the headroom in fit_size),
+    else the slot caps."""
+    cache = ctx.setdefault('_risk', {})
+    if side not in cache: cache[side] = risk_assess(side, ctx['pos'], ctx['equity']) if RC.ENABLED else dict(mode='slots', error='risk_caps disabled')
+    rca = cache[side]
+    if rca.get('mode') == 'risk': return None, rca
+    if len(ctx['pos']) >= MAXALL: return 'overall cap', rca
+    return dircap_block(side, ctx['pos']), rca
 
 def cooldown_block(inst, side, now=None):
     """None if the pair+side may be entered, else the SKIP reason. A read error is a skip."""
@@ -198,9 +329,13 @@ def evaluate(setup, ctx):
     if sw:
         log_block(setup, 'stock_perp (data error)' if 'data error' in sw else 'stock_perp', sw, ctx, dict(detail=how))
         return None, sw
+    why = universe_block(setup, ctx)
+    if why: return None, why
     why = cooldown_block(inst, side)
     if why: return None, why
-    why = dircap_block(side, pos)
+    why, rca = cap_check(side, ctx)
+    if why: return None, why
+    why = unresolved_block(inst, pos)
     if why: return None, why
     if not ins: return None, 'instrument not found'
     if ins.get('state') not in (None, 'live') or ins.get('offTime'): return None, 'instrument not live or scheduled for delisting'
@@ -231,20 +366,27 @@ def evaluate(setup, ctx):
         log_block(setup, '1h_trend (data error)' if 'data error' in tw else '1h_trend', tw, ctx, dict(detail=t1d))
         return None, tw
     equity, avail = ctx['equity'], ctx['avail']
-    size = size_for(equity, entry, stop, cv, lot)
-    if size < mins: return None, f'size {size:g} below min {mins:g}'
-    notional = size * cv * entry
-    lev, cap = pick_lev(notional, equity, avail, float(ins.get('maxLeverage') or LEVMAX))
-    if lev is None: return None, f'no leverage <= {LEVMAX} fits: notional {notional:.2f}, margin cap {cap:.2f}'
-    liq = est_liq(entry, side, lev, float(ins.get('maintenanceMarginRate') or MMR_DEFAULT))
+    mmr = float(ins.get('maintenanceMarginRate') or MMR_DEFAULT)
+    sz = fit_size(equity, avail, entry, stop, cv, lot, mins, float(ins.get('maxLeverage') or LEVMAX), mmr,
+                  rca.get('headroom') if rca.get('mode') == 'risk' else None)
+    if sz['gate']:
+        why = sz['why'] + (' | ' + RC.summary(rca) if sz['gate'] == 'cap_risk' else '')
+        log_block(setup, sz['gate'], why, ctx, dict(sizing={k: v for k, v in sz.items() if k not in ('gate', 'why')}))
+        return None, why
+    size, notional, lev, cap = sz['size'], sz['notional'], sz['lev'], sz['cap']
+    liq = est_liq(entry, side, lev, mmr)
     if risk >= MAX_STOP_TO_LIQ * abs(liq - entry):
-        return None, f'liq {liq:.8g} too close: stop dist {risk:.8g} >= {MAX_STOP_TO_LIQ:g} x liq dist {abs(liq-entry):.8g} at {lev}x'
+        why = f'liq {liq:.8g} too close: stop dist {risk:.8g} >= {MAX_STOP_TO_LIQ:g} x liq dist {abs(liq-entry):.8g} at {lev}x'
+        log_block(setup, 'liq', why, ctx); return None, why
     live = pair_positions(inst)
     if live: return None, 'existing position on pair; leverage untouched'
     coid = bf.client_order_id(PREFIX)
     plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr=rr, rr_net=net_rr(side, entry, stop, target),
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
-                stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
+                stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, entry_slip_frac=ENTRY_SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
+                size_full=sz['size_full'], scaled_down=sz['scaled_down'], scaled_by=sz['scaled_by'], risk_pct_actual=sz['risk_pct_actual'],
+                fee_share=sz['fee_share'], universe_tier=UN.tier_of(setup), vol_rank=setup.get('vol_rank'),
+                risk_caps={k: rca.get(k) for k in ('mode', 'total_pct', 'dir_pct', 'headroom', 'n_pos', 'error')},
                 lev_req=dict(instId=inst, leverage=str(lev), marginMode=NEW_MM, positionSide='net'),
                 order_req=dict(instId=inst, marginMode=NEW_MM, positionSide='net', side=side, orderType='market',
                                size=fs(size), tpTriggerPrice=fs(target), tpOrderPrice='-1', slTriggerPrice=fs(stop),
@@ -300,7 +442,9 @@ def place(plan):
     # the bot's and it counts toward the direction cap. No record, no order.
     rec = dict(instId=inst, side=side, clientOrderId=plan['order_req']['clientOrderId'], opened_at=now_utc().isoformat(),
                entry_quote=plan['entry'], initial_stop=plan['stop'], target=plan['target'], stop_dist=plan['stop_dist'],
-               atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False, asset_class=plan.get('asset_class'), provisional=True)
+               atr1h=plan['atr1h'], equity_at_entry=plan.get('equity'), be_done=False, asset_class=plan.get('asset_class'),
+               universe_tier=plan.get('universe_tier'), vol_rank=plan.get('vol_rank'), scaled_down=plan.get('scaled_down'),
+               risk_pct_actual=plan.get('risk_pct_actual'), risk_caps=plan.get('risk_caps'), provisional=True)
     try: registry.put(rec)
     except Exception as e: return dict(ok=False, why=f'bot_positions.json not writable ({str(e)[:120]}); order NOT sent', plan=plan)
     def _drop():
@@ -366,7 +510,7 @@ def run(setups, scan_ts, now=None, dry=False):
         try: registry.prune(pos)
         except Exception: pass
     if not equity > 0: return dict(ok=False, why='equity unreadable')
-    if len(pos) >= MAXALL: return dict(ok=False, why='overall cap')
+    if len(pos) >= RC.MAX_POS: return dict(ok=False, why=f'max positions {len(pos)}/{RC.MAX_POS}')   # hard backstop
     if mode != 'net_mode': return dict(ok=False, why=f'account position mode {mode} != net_mode')
     ctx = dict(equity=equity, avail=avail, pos=pos, ins=instruments(), dry=dry, scan_ts=scan_ts, warnings=[])
     skipped = []
@@ -374,11 +518,14 @@ def run(setups, scan_ts, now=None, dry=False):
         s = dict(s, _rank=i + 1)
         try: plan, why = evaluate(s, ctx)
         except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
-        if plan is None: skipped.append(dict(instId=s.get('instId'), why=why)); continue
+        if plan is None:
+            if LOG_ALL_SKIPS: log_block(s, gate_of(why), why, ctx)   # every skip is a block line (no-op if a gate already logged it)
+            skipped.append(dict(instId=s.get('instId'), why=why)); continue
         if dry: return dict(ok=True, dry=True, plan=plan, skipped=skipped, warnings=ctx['warnings'])
         out = place(plan); out['skipped'] = skipped
         if ctx['warnings']: out.setdefault('warnings', []).extend(ctx['warnings'])
         if out.get('ok') or out.get('order_resp') is not None: return out   # accepted, rejected or unknown: stop here
+        if LOG_ALL_SKIPS: log_block(s, 'leverage', out.get('why'), ctx)
         skipped.append(dict(instId=s.get('instId'), why=out.get('why'))); continue  # leverage refused: try next
     return dict(ok=False, why='no setup passed the checks', skipped=skipped, warnings=ctx['warnings'], **(dict(dry=True) if dry else {}))
 

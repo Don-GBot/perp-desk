@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-10-20 (sync 3)
+
+Entry and sizing rules (all on in `config.example.yaml`):
+- **Top-40 universe** (`scan.universe_ext_enabled`, `universe_ext_size: 40`, `scripts/universe.py`): `scan.py` ranks the
+  top 40 by 24h quote volume (before the spread filter, stored per scan as `vol_ranks`, `vol_rank`, `universe_tier`).
+  Ranks 1–25 (`core`) keep the old rules; ranks 26–40 (`ext`) also need a fresh news-analyst rating, else skip
+  `no_fundamentals` (fails closed). `scanner.py` uses the same universe.
+- **5% risk is a maximum** (`risk.scale_down`): instead of skipping, the size is cut (never raised) to the binding limit:
+  leverage max 20 / instrument max, margin cap 25% of equity / 95% of free margin, liquidation > 2x the stop distance,
+  and the risk-cap headroom. A scaled trade whose round-trip fees exceed 1/3 of its stop-out loss is skipped
+  (`fee_heavy`), one below the instrument minimum `below_min_size`. Shared `execute.fit_size`.
+- **Risk-based caps** (`risk.risk_caps`, `scripts/riskcap.py`): total open risk (loss at the current stops from the
+  mark, incl. exit fee + slippage) + new <= 20% of equity, same-direction bot risk + new <= 15%, scaled to the headroom
+  else `cap_risk`; hard backstop 8 positions; a manual position without a stop counts 5%; a stop counts as 0 risk only
+  if a stop-out nets >= 0 after entry + exit fees and slippage. Fail closed to the old slot caps (4 / 3 per side) when
+  any position's risk can't be computed: missing mark (never substituted by entry), stop orders covering only part of
+  the size, bot position without a stop, a bot record that doesn't match the live position, unreadable or full
+  (100-row) TP/SL page.
+- **Entry slippage** (`fees.entry_slip_frac: 0.0018`): planned stop-out loss in sizing now includes 0.18% expected
+  market-entry slippage (= the exit-slip estimate until entry-fill data exists). The hard cut is unchanged (it uses the
+  real average price) and the fee_heavy share keeps its old denominator.
+- **Unresolved-record block** (`entry.unresolved_record_block`): no entry, either side, on a pair holding a bot record
+  with no matching live position or a closed record whose close line isn't logged yet. `registry.put` never overwrites
+  another trade's record (the order is then not sent).
+- **Adoption from order history** (`bot.adopt_from_history`): `manage.py` rebuilds the missing record of a position
+  owned through a bot-prefixed opening order in the exchange history.
+
+Logging (no rule change):
+- Every executor skip is a `blocked_setups.jsonl` line (`logging.log_all_skips`), each setup at most once per run, with
+  `universe_tier` / `vol_rank`; sizing gates carry the sizing numbers, `cap_risk` the risk-cap summary.
+- `--dry` decision runs of the scheduled routine (RUN_ID = a manage.py run record from the last
+  `logging.scheduled_dry_window_s`) log to the live file with mode `scheduled_dry`; ad-hoc dry runs stay in the dry log.
+- Plans, bot records, shadow rows carry `scaled_down`, `scaled_by`, `risk_pct_actual`, `fee_share`, `risk_caps`.
+
+Shadows:
+- New book **V_RR2**: live rules with gross min R:R `shadow_variants.rr2_min` (2.0); also walks the scan's rejected
+  2 <= R:R < 3 setups rebuilt with `scan.geometry`; rows tagged `rr_bucket`. Every book follows the universe tiers,
+  risk caps (on the virtual book) and `fit_size`; rows carry `universe_tier`; R uses the planned (entry-slip) loss.
+- `shadow_swap.py`: universe tiers, `fit_size` with the live risk-cap headroom, `max_age_min` 35 (= live), `--stats --by universe_tier`.
+
 ## 2026-10-20
 
 Entry rules (both on in `config.example.yaml`; turn off in `config.yaml` if you don't want them):

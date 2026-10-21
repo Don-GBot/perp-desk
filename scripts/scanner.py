@@ -7,7 +7,8 @@ Optionally, run it standalone (cron or its own agent) INSTEAD, never both: the d
 
   python3 scripts/scanner.py
 
-Universe: exactly the executor's (scan.universe(): top N by 24h quote volume, drop wide spreads).
+Universe: exactly the executor's (scan.universe(): top universe.top_n() by 24h quote volume, i.e. universe_ext_size when
+scan.universe_ext_enabled, else universe_size; drop wide spreads).
 Alerts (config.yaml -> scanner):
   - Move: |change from 24h open| >= move_alert_pct. Re-alert only on a direction flip or a further
     same-direction move of >= max(realert_min_pts, realert_frac x last reported move). Memory: memory_hours.

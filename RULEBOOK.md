@@ -29,7 +29,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 
 | Rule | Value |
 |---|---|
-| Universe | Identical to the Executor's: top `universe_size` USDT perps by 24h quote volume, then drop spread > `max_spread_pct`. |
+| Universe | Identical to the Executor's: top `universe_ext_size` (40; `universe_size` 25 if `universe_ext_enabled` is off) USDT perps by 24h quote volume, then drop spread > `max_spread_pct`. |
 | Big move | abs(change from 24h open) ≥ `move_alert_pct` (5%). |
 | Re-alert | Only on a direction flip, or a further same-direction move ≥ max(`realert_min_pts`, `realert_frac` × last reported move). Memory `memory_hours` (24h). |
 | New in universe | Pair not seen in the universe in the last 24h. |
@@ -59,7 +59,9 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | 1H trend gate | `entry.trend_1h` (on): longs only in a 1H uptrend, shorts only in a 1H downtrend (EMA20/EMA50 + close vs EMA50 on 200 closed 1H candles, `scripts/trend1h.py`). Flat blocks both. A data error skips the setup (fails closed). Logged as `1h_trend`. |
 | Stock perps | `entry.stock_perp_block` (on): no new entries on stock perps (equities, ETFs, index perps, tokenized stocks): the maintained list in `scripts/stockperp.py` OR exchange assetClass Stocks/Indices. Checked first; unreadable metadata for an unlisted pair skips (fails closed). Open positions are never touched. Logged as `stock_perp`. |
 | Equity | Skip if equity can't be read. |
-| Caps | `max_open` (4) overall, all positions incl. manual. `max_per_direction` (3): open BOT positions per side; manual positions don't count. Entry-only, never closes anything. If the bot positions can't be read, the entry is skipped. |
+| Universe tier | Volume ranks 1–`universe_size` (25) are `core`. Ranks beyond that (26–40, `ext`) also need a fresh news-analyst rating for the pair (`fundamentals.json`, younger than `news_gate.fresh_hours`), else skip `no_fundamentals` (fails closed). The rank is fixed per scan (`scan.json` `vol_ranks`). `scripts/universe.py`. |
+| Caps | Risk caps (`risk.risk_caps`, `scripts/riskcap.py`): open risk of a position = loss if its CURRENT stop is hit from the live mark, incl. exit taker fee and slippage; 0 only if a stop-out nets ≥ 0 after entry + exit fees and slippage; a manual position with no stop counts 5% of equity. Total open risk + the new trade ≤ `total_pct` (20%) of equity; same-direction BOT open risk + new ≤ `direction_pct` (15%). The new trade is scaled down to the headroom (skip `cap_risk` if it then falls below the minimum). Hard backstop `max_positions` (8). Fail closed: if any position's risk can't be computed (no mark, stop orders covering only part of the size, bot position without a stop, ambiguous ownership, orders unreadable), the slot caps apply: `max_open` (4) overall incl. manual, `max_per_direction` (3) bot positions per side. Entry-only, never closes anything. |
+| Unresolved record | `entry.unresolved_record_block` (on): no entry, either side, on a pair holding a bot record with no matching live position, or a closed bot record whose close line was not found yet. `bot_positions.json` never overwrites another trade's record. |
 | Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (exit at/beyond the BE stop minus a slippage tolerance, or a loss under 0.5R), manual positions and manual closes don't trigger it. A read error skips the entry. |
 | No duplicates | No new trade on a pair with any position. |
 | One per run | At most one new open per run. If the best setup fails a check, the next one is tried. |
@@ -75,11 +77,12 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 ### Sizing, leverage, margin
 | Rule | Value |
 |---|---|
-| Risk per trade | `risk_per_trade_pct` of live equity lost at the technical stop, including entry and exit taker fees and the slippage buffer (`slip_frac` 0.18% of entry). Default 5%. Up to `max_open` × that at once (4 × 5% = 20%). |
-| Size | floor(equity × risk / (contract value × (stop distance + fee × (entry + stop) + slip_frac × entry)), lot size). Skip if below the instrument minimum. |
+| Risk per trade | A MAXIMUM of `risk_per_trade_pct` (5%) of live equity lost at the technical stop, including entry slippage (`entry_slip_frac` 0.18%), entry and exit taker fees and the exit slippage buffer (`slip_frac` 0.18% of entry). Total open risk is capped by the risk caps (20%). |
+| Size | Full size = floor(equity × risk / (contract value × (stop distance + entry_slip_frac × entry + fee × (entry + stop) + slip_frac × entry)), lot size). Skip if below the instrument minimum. With `risk.scale_down` (on) the size is then cut, never raised, lot-rounded, to the binding limit: the risk-cap headroom, then leverage ≤ min(`max` 20, instrument max, highest L whose estimated liquidation is > 2× the stop distance), then margin ≤ min(25% equity, 95% free margin). |
+| Fee-heavy skip | A scaled-down trade is skipped (`fee_heavy`) if round-trip taker fees are more than `fee_heavy_max_share` (1/3) of its stop-out loss (stop distance + fees + exit slip), or (`below_min_size`) if it falls below the instrument minimum. |
 | Margin mode | `margin_mode` (isolated) for new bot trades. |
-| Leverage | Lowest integer L in [`min`, `max`] (3–20), also ≤ the instrument max, with margin = notional / L ≤ min(`margin_cap_pct` (25%) of equity, 95% of free margin). Skip if none fits. |
-| Liquidation buffer | Skip if stop distance ≥ `max_stop_to_liq` (0.5) × estimated liquidation distance, i.e. liquidation must be more than 2× further than the stop. |
+| Leverage | Lowest integer L in [`min`, allowed max] whose margin = notional / L ≤ min(`margin_cap_pct` (25%) of equity, 95% of free margin). With `scale_down` off: skip if none fits. |
+| Liquidation buffer | Skip if stop distance ≥ `max_stop_to_liq` (0.5) × estimated liquidation distance, i.e. liquidation must be more than 2× further than the stop (`liq`). |
 | Existing pairs | Never change leverage on a pair with any existing position. |
 
 Note: with a small account, low-volatility pairs (1H ATR under ~1%) often fail the leverage fit and never trade. That is expected.
@@ -103,7 +106,7 @@ Note: with a small account, low-volatility pairs (1H ATR under ~1%) often fail t
 | Flagged news | Medium or high confidence may tighten a stop, never widen it. Low confidence is logged only. |
 
 ### Manual trades (opened by the owner)
-Controlled by `bot.protect_manual_trades` (default `true`). A position is the bot's if a `bot_positions.json` record matches it, or the exchange order history shows a filled, non-reduce-only opening order with the bot's client order id prefix (`bot.client_order_prefix`) created within 120 s of the position. A record matches only if pair and side agree and the position was created within 120 s of the record's `opened_at` (or has the recorded position create time). Pair and side alone never count, so an old record cannot claim a later manual trade. Records that match no open position are pruned at the start of every `execute.py` and `manage.py` run.
+Controlled by `bot.protect_manual_trades` (default `true`). A position is the bot's if a `bot_positions.json` record matches it, or the exchange order history shows a filled, non-reduce-only opening order with the bot's client order id prefix (`bot.client_order_prefix`) created within 120 s of the position. A record matches only if pair and side agree and the position was created within 120 s of the record's `opened_at` (or has the recorded position create time). Pair and side alone never count, so an old record cannot claim a later manual trade. Records that match no open position are pruned at the start of every `execute.py` and `manage.py` run. With `bot.adopt_from_history` (on), `manage.py` rebuilds the missing record of a position owned through the order history (entry = average price, stop / target = the live TP/SL), so it gets full bot treatment; it never overwrites an existing record.
 - `true`: the hard cut, break-even and scripted closes apply only to bot positions. A manual position without a stop gets an alert to the owner; the bot places nothing on it. The bot never closes, trims, adds to or re-levers a manual position.
 - `false`: manual positions are managed exactly like bot positions.
 Either way, manual positions block bot entries on that pair and count toward the caps.
@@ -125,7 +128,7 @@ Every run, open position and closed trade goes in `state.json`. Each new entry r
 Script-written logs (logging only; none of them changes a stop, order or close):
 | Log | Written by | Content |
 |---|---|---|
-| `blocked_setups.jsonl` | `execute.py` (and `blocklog.py add` for the agent) | One line per news-gate, 1h-trend or stock-perp block: pair, side, levels, rating, gate_reason, asset_class. `--dry` runs go to `logs/blocked_setups_dry.jsonl` instead. |
+| `blocked_setups.jsonl` | `execute.py` (and `blocklog.py add` for the agent) | One line per skipped setup (`logging.log_all_skips`; gate_reason e.g. news_gate, 1h_trend, stock_perp, no_fundamentals, cooldown, dir_cap, overall_cap, unresolved_record, fee_heavy, cap_risk, liq, below_min_size): pair, side, levels, rating, gate_reason, asset_class, universe_tier, vol_rank. `--dry` runs go to `logs/blocked_setups_dry.jsonl` instead, except the scheduled routine's dry decision run (RUN_ID = a manage.py run record from the last 30 min), which logs to the live file with mode `scheduled_dry`. |
 | `runs.json` | `manage.py` | One run record per invocation (run_id in the output). The agent adds its own fields with `runlog.py annotate`, never by hand. |
 | `closed_trades.jsonl` | `manage.py` | One line per closed bot position, matched to the exchange positions history by positionId, else createTime within 120 s (one history row per record). |
 | funding fields | `manage.py` | `funding_paid` / `funding_n` on open bot records and closed-trade lines (exchange funding-fee bills, read-only). |

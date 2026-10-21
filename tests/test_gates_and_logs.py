@@ -313,7 +313,8 @@ class TestDirCap(GateBase):
 class TestSlippageAndBE(NoNetwork):
     def test_sizing_includes_slippage(self):
         self.assertAlmostEqual(EX.risk_per_coin(100, 98), 2 + 0.0006 * 198 + 0.0018 * 100)
-        self.assertEqual(EX.size_for(1000, 100, 98, 1, "0.01"), float(int(50 / EX.risk_per_coin(100, 98) * 100) / 100))
+        self.assertAlmostEqual(EX.planned_risk_per_coin(100, 98), 2 + 0.0018 * 100 + 0.0006 * 198 + 0.0018 * 100)   # + entry slip
+        self.assertEqual(EX.size_for(1000, 100, 98, 1, "0.01"), float(int(50 / EX.planned_risk_per_coin(100, 98) * 100) / 100))
     def test_hard_cut_distance_solves_all_in(self):
         import manage
         for long_ in (True, False):
