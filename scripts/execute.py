@@ -39,10 +39,11 @@ The news gate (news_gate.check) and, when enabled, the macro window (news_gate.m
 applied inside evaluate() to every candidate, so falling through to the next setup can never open a
 news-blocked trade.
 
-Every skip is logged to DATA_DIR/blocked_setups.jsonl (blocklog.py, source "execute"; with logging.log_all_skips,
+Every per-setup skip is logged to DATA_DIR/blocked_setups.jsonl (blocklog.py, source "execute"; with logging.log_all_skips,
 otherwise only the news / 1h / stock-perp / universe / sizing gates); --dry lines go to
 DATA_DIR/logs/blocked_setups_dry.jsonl, except the scheduled routine's dry decision run (mode "scheduled_dry", live
-file; blocklog.scheduled_dry). A log failure only adds a warning.
+file; blocklog.scheduled_dry). A log failure only adds a warning. Run-level exits (stale scan, equity unreadable, max
+positions, not net mode) end the run before any setup is walked: they return a gate_reason and write no block line.
 
 If the order request times out or the connection drops, the script looks the order up by its
 clientOrderId (and checks positions) before deciding it failed.
@@ -114,7 +115,8 @@ def size_for(equity, entry, stop, cv, lot, fee=FEE, slip=SLIP):
 
 def fee_share(entry, stop):
     """Round-trip taker fees / stop-out loss, per coin (size cancels). The denominator deliberately leaves out the
-    entry-slip term (|entry - stop| + taker x (entry + stop) + slip_frac x entry)."""
+    entry-slip term (|entry - stop| + taker x (entry + stop) + slip_frac x entry). Deliberate: the threshold keeps its
+    meaning from before entry slippage was added to sizing."""
     return FEE * (entry + stop) / risk_per_coin(entry, stop)
 
 def lev_liq_max(entry, stop, mmr=MMR_DEFAULT, maxlev=LEVMAX):
@@ -132,7 +134,8 @@ def fit_size(equity, avail, entry, stop, cv, lot, mins, maxlev=LEVMAX, mmr=MMR_D
       2. leverage: L <= min(leverage.max, maxlev, lev_liq_max); none -> liq
       3. margin: lowest L whose margin fits min(margin_cap, free margin buffer) (pick_lev); if none, the size that fits at
          the highest allowed L
-    A scaled size is skipped if fee_share > fee_heavy_max_share (fee_heavy) or < minSize (below_min_size).
+    A scaled size is skipped if fee_share > fee_heavy_max_share (fee_heavy) or < minSize (below_min_size). fee_heavy applies
+    ONLY to scaled-down trades (deliberate, as live): an unscaled full-risk trade is never skipped for its fee share.
     risk.scale_down false -> no scaling: no_leverage_fit skip (the liq check then runs in evaluate)."""
     size = size_for(equity, entry, stop, cv, lot); fsh = fee_share(entry, stop)
     out = dict(size=size, size_full=size, lev=None, cap=None, notional=size * cv * entry, scaled_down=False, scaled_by=[],
@@ -333,9 +336,9 @@ def evaluate(setup, ctx):
     if why: return None, why
     why = cooldown_block(inst, side)
     if why: return None, why
-    why, rca = cap_check(side, ctx)
+    why = unresolved_block(inst, pos)   # cheap local check before the cap reads
     if why: return None, why
-    why = unresolved_block(inst, pos)
+    why, rca = cap_check(side, ctx)
     if why: return None, why
     if not ins: return None, 'instrument not found'
     if ins.get('state') not in (None, 'live') or ins.get('offTime'): return None, 'instrument not live or scheduled for delisting'
@@ -504,14 +507,15 @@ def place(plan):
 def run(setups, scan_ts, now=None, dry=False):
     """Try setups in order; open at most one (none with dry=True: the first passing plan is returned). Returns a result dict."""
     why = check_scan_fresh(scan_ts, now)
-    if why: return dict(ok=False, why=why)
+    if why: return dict(ok=False, why=why, gate_reason='stale_scan')
     equity, avail, pos, mode = account()
     if not dry:   # a dry run never writes bot_positions.json / closed_pending.json
         try: registry.prune(pos)
         except Exception: pass
-    if not equity > 0: return dict(ok=False, why='equity unreadable')
-    if len(pos) >= RC.MAX_POS: return dict(ok=False, why=f'max positions {len(pos)}/{RC.MAX_POS}')   # hard backstop
-    if mode != 'net_mode': return dict(ok=False, why=f'account position mode {mode} != net_mode')
+    # run-level exits: gate_reason only, no block line (no setup was walked)
+    if not equity > 0: return dict(ok=False, why='equity unreadable', gate_reason='equity')
+    if len(pos) >= RC.MAX_POS: return dict(ok=False, why=f'max positions {len(pos)}/{RC.MAX_POS}', gate_reason='max_positions')   # hard backstop
+    if mode != 'net_mode': return dict(ok=False, why=f'account position mode {mode} != net_mode', gate_reason='position_mode')
     ctx = dict(equity=equity, avail=avail, pos=pos, ins=instruments(), dry=dry, scan_ts=scan_ts, warnings=[])
     skipped = []
     for i, s in enumerate(setups):
@@ -519,7 +523,7 @@ def run(setups, scan_ts, now=None, dry=False):
         try: plan, why = evaluate(s, ctx)
         except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
         if plan is None:
-            if LOG_ALL_SKIPS: log_block(s, gate_of(why), why, ctx)   # every skip is a block line (no-op if a gate already logged it)
+            if LOG_ALL_SKIPS: log_block(s, gate_of(why), why, ctx)   # every per-setup skip is a block line (no-op if a gate already logged it)
             skipped.append(dict(instId=s.get('instId'), why=why)); continue
         if dry: return dict(ok=True, dry=True, plan=plan, skipped=skipped, warnings=ctx['warnings'])
         out = place(plan); out['skipped'] = skipped

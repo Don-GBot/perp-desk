@@ -308,7 +308,8 @@ class TestDirCap(GateBase):
     def test_unreadable_registry_fails_closed(self):
         with open(config.data_path(registry.FILE), "w") as fh: fh.write("nope")
         plan, why = EX.evaluate(SETUP, self.ctx)
-        self.assertIsNone(plan); self.assertTrue(why.startswith("direction cap check error"))
+        self.assertIsNone(plan); self.assertTrue(why.startswith("unresolved_record check error"), why)   # first registry reader (runs before caps)
+        self.assertTrue(EX.dircap_block("buy", []).startswith("direction cap check error"))                # the cap check still fails closed
 
 class TestSlippageAndBE(NoNetwork):
     def test_sizing_includes_slippage(self):

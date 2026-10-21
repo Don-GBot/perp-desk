@@ -209,3 +209,27 @@ class TestShadowRR2AndRisk(GateBase):
         self.assertTrue(why.startswith('no_fundamentals'), why)
 
 if __name__ == '__main__': unittest.main()
+
+class TestReviewFollowups(GateBase):
+    def test_run_level_max_positions_backstop(self):
+        pos = [dict(instId=f'X{i}-USDT', positions='1', averagePrice='1', markPrice='1') for i in range(RC.MAX_POS)]
+        n0 = len(BL.load_live())
+        with mock.patch.object(EX, 'account', return_value=(1000.0, 1000.0, pos, 'net_mode')), \
+             mock.patch.object(EX, 'evaluate', side_effect=AssertionError('no setup may be walked')):
+            r = EX.run([SETUP], iso(NOW))
+        self.assertFalse(r['ok']); self.assertEqual(r['gate_reason'], 'max_positions')
+        self.assertEqual(len(BL.load_live()), n0)                                   # run-level: no block line
+    def test_fee_heavy_not_applied_unscaled(self):
+        # with the default 1/3 a fee-heavy stop can never fit unscaled, so lower the threshold: a 3% stop's full size fits
+        with mock.patch.object(EX, 'FEE_HEAVY_MAX', 0.01):
+            self.assertGreater(EX.fee_share(100.0, 97.0), EX.FEE_HEAVY_MAX)
+            sz = EX.fit_size(1000, 1000, 100.0, 97.0, 1.0, '0.01', 0.01)
+            self.assertFalse(sz['scaled_down'], sz); self.assertIsNone(sz['gate'], sz)
+            self.assertEqual(EX.fit_size(1000, 1000, 100.0, 99.5, 1.0, '0.01', 0.01)['gate'], 'fee_heavy')   # scaled -> applies
+    def test_gate_of_mapping(self):
+        for why, g in (('cooldown: x', 'cooldown'), ('overall cap', 'overall_cap'), ('direction cap 3/3', 'dir_cap'),
+                       ('unresolved_record (X)', 'unresolved_record'), ('pair already has a position', 'duplicate'),
+                       ('R:R 2.1 < 3', 'rr'), ('stop 0.5x ATR < 1', 'atr'), ('4H trend now down, need up', 'trend'),
+                       ('news gate: x', 'news_gate'), ('macro window: CPI', 'macro_window'), ('instrument not found', 'instrument'),
+                       ('long needs stop < entry < target', 'geometry'), ('error: boom', 'error'), ('???', 'other'), (None, 'other')):
+            self.assertEqual(EX.gate_of(why), g, why)

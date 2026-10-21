@@ -33,7 +33,8 @@ risk:
   # lot-rounded) to the binding limit: leverage.max, the instrument max leverage, the margin cap / free margin,
   # the highest leverage whose estimated liquidation is > 1/max_stop_to_liq x the stop distance, and the
   # risk_caps headroom. A scaled trade is skipped as fee_heavy if round-trip taker fees are more than
-  # fee_heavy_max_share of its stop-out loss, or below_min_size under the instrument minimum.
+  # fee_heavy_max_share of its stop-out loss (only scaled trades; a full-size trade is never fee_heavy skipped),
+  # or below_min_size under the instrument minimum.
   # false: the old behaviour (skip when the full size doesn't fit).
   scale_down: true
   fee_heavy_max_share: 0.3333333333333333
@@ -73,7 +74,7 @@ fees:
   slip_frac: 0.0018
   # Expected adverse MARKET-ENTRY fill vs the quote, fraction of entry. Added to the planned stop-out loss in
   # sizing (not in the hard cut, which uses the real average price). Default = slip_frac as a conservative
-  # estimate until you have entry-fill data. The fee_heavy share keeps the old denominator (without this term).
+  # estimate until you have entry-fill data. The fee_heavy share deliberately keeps the old denominator (without this term).
   entry_slip_frac: 0.0018
 
 # ---------------------------------------------------------------------------
@@ -254,7 +255,7 @@ logging:
   # manage.py appends one run record per invocation to data/runs.json (run_id printed in its output);
   # the agent attaches its own fields with scripts/runlog.py annotate.
   run_records: true
-  # Every executor skip becomes a blocked_setups line (gate_reason from the skip reason), not only news /
+  # Every per-setup executor skip becomes a blocked_setups line (gate_reason from the skip reason), not only news /
   # 1h / stock-perp / sizing gates.
   log_all_skips: true
   # A --dry run whose RUN_ID names a manage.py run record (runs.json) written within this many seconds is the

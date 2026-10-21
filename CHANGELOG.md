@@ -6,11 +6,12 @@ Entry and sizing rules (all on in `config.example.yaml`):
 - **Top-40 universe** (`scan.universe_ext_enabled`, `universe_ext_size: 40`, `scripts/universe.py`): `scan.py` ranks the
   top 40 by 24h quote volume (before the spread filter, stored per scan as `vol_ranks`, `vol_rank`, `universe_tier`).
   Ranks 1–25 (`core`) keep the old rules; ranks 26–40 (`ext`) also need a fresh news-analyst rating, else skip
-  `no_fundamentals` (fails closed). `scanner.py` uses the same universe.
+  `no_fundamentals` (fails closed). `scanner.py` uses the same universe, so its alerts (moves, new pairs, coils, flags)
+  now cover the top 40 too; this is intended.
 - **5% risk is a maximum** (`risk.scale_down`): instead of skipping, the size is cut (never raised) to the binding limit:
   leverage max 20 / instrument max, margin cap 25% of equity / 95% of free margin, liquidation > 2x the stop distance,
   and the risk-cap headroom. A scaled trade whose round-trip fees exceed 1/3 of its stop-out loss is skipped
-  (`fee_heavy`), one below the instrument minimum `below_min_size`. Shared `execute.fit_size`.
+  (`fee_heavy`, scaled trades only; full-size trades are never fee_heavy skipped), one below the instrument minimum `below_min_size`. Shared `execute.fit_size`.
 - **Risk-based caps** (`risk.risk_caps`, `scripts/riskcap.py`): total open risk (loss at the current stops from the
   mark, incl. exit fee + slippage) + new <= 20% of equity, same-direction bot risk + new <= 15%, scaled to the headroom
   else `cap_risk`; hard backstop 8 positions; a manual position without a stop counts 5%; a stop counts as 0 risk only
@@ -20,7 +21,7 @@ Entry and sizing rules (all on in `config.example.yaml`):
   (100-row) TP/SL page.
 - **Entry slippage** (`fees.entry_slip_frac: 0.0018`): planned stop-out loss in sizing now includes 0.18% expected
   market-entry slippage (= the exit-slip estimate until entry-fill data exists). The hard cut is unchanged (it uses the
-  real average price) and the fee_heavy share keeps its old denominator.
+  real average price) and the fee_heavy share deliberately keeps its old denominator (no entry-slip term).
 - **Unresolved-record block** (`entry.unresolved_record_block`): no entry, either side, on a pair holding a bot record
   with no matching live position or a closed record whose close line isn't logged yet. `registry.put` never overwrites
   another trade's record (the order is then not sent).
@@ -28,7 +29,8 @@ Entry and sizing rules (all on in `config.example.yaml`):
   owned through a bot-prefixed opening order in the exchange history.
 
 Logging (no rule change):
-- Every executor skip is a `blocked_setups.jsonl` line (`logging.log_all_skips`), each setup at most once per run, with
+- Every per-setup executor skip is a `blocked_setups.jsonl` line (run-level exits — stale scan, equity unreadable, max
+  positions, not net mode — return a gate_reason only) (`logging.log_all_skips`), each setup at most once per run, with
   `universe_tier` / `vol_rank`; sizing gates carry the sizing numbers, `cap_risk` the risk-cap summary.
 - `--dry` decision runs of the scheduled routine (RUN_ID = a manage.py run record from the last
   `logging.scheduled_dry_window_s`) log to the live file with mode `scheduled_dry`; ad-hoc dry runs stay in the dry log.
