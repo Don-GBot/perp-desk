@@ -52,7 +52,7 @@ positions, not net mode) end the run before any setup is walked: they return a g
 If the order request times out or the connection drops, the script looks the order up by its
 clientOrderId (and checks positions) before deciding it failed.
 """
-import os, sys, json, time, argparse, datetime as dt
+import os, sys, json, math, time, argparse, datetime as dt
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blofin_client as bf
@@ -135,16 +135,21 @@ def filter_gate(entry, stop, rr):
         if c >= COST_HEAVY_MAX: return 'cost_heavy', f'cost_heavy: round-trip fees {c*100:.1f}% of stop-out loss >= {COST_HEAVY_MAX*100:g}%'
     return None, None
 
+def _pos_finite(x):
+    try: return math.isfinite(float(x)) and float(x) > 0
+    except (TypeError, ValueError): return False
+
 def composite_score(side, entry, stop, target, atr1h, ema_fast4h, ema_slow4h, btc_trend4h):
     """Composite rank score (higher = better) and its components. Pure; weights in entry.composite.
-      target: -target_atr_pen per 1H ATR of |target - entry| beyond target_atr_free
+      target: -target_atr_pen per 1H ATR of |target - entry| beyond target_atr_free (no valid 1H ATR: unscorable, score None)
       gap:    4H EMA fast-slow gap % in the trade direction: + min(gap, gap_full_pct) / gap_full_pct, and above
               gap_full_pct -gap_over_pen per % beyond it (a gap against the trade scores negative)
       cost:   -fee_share_pen per percentage point of fee_share above fee_share_free
       btc:    +btc_bonus if the BTC 4H trend agrees with the side"""
     long_ = side in ('buy', 'long')
-    tgt_atr = abs(target - entry) / atr1h if atr1h else None
-    s_tgt = -CP["target_atr_pen"] * max(0.0, tgt_atr - CP["target_atr_free"]) if tgt_atr is not None else 0.0
+    if not _pos_finite(atr1h): return dict(score=None, error='1H ATR unreadable')   # unscorable (ranked last), like missing 4H EMA
+    tgt_atr = abs(target - entry) / atr1h
+    s_tgt = -CP["target_atr_pen"] * max(0.0, tgt_atr - CP["target_atr_free"])
     gap = (ema_fast4h - ema_slow4h) / ema_slow4h * 100 * (1 if long_ else -1) if ema_fast4h and ema_slow4h else None
     full = float(CP["gap_full_pct"])
     if gap is None: s_gap = 0.0
@@ -164,8 +169,14 @@ def ema4h(inst, closes4h=None):
     tf = E['trend_filter']; c = closes4h if closes4h is not None else [x[3] for x in candles(inst, '4H')]
     return ema(c, tf['ema_fast'])[-1], ema(c, tf['ema_slow'])[-1]
 
-def btc_trend4h():
-    try: return trend([x[3] for x in candles('BTC-USDT', '4H')])[0]
+def closes_cached(inst, bar, ctx=None):
+    """Closes of inst/bar, fetched at most once per run when ctx is given (run-scoped cache in ctx['_closes'])."""
+    cache = ctx.setdefault('_closes', {}) if ctx is not None else {}
+    if (inst, bar) not in cache: cache[(inst, bar)] = [x[3] for x in candles(inst, bar)]
+    return cache[(inst, bar)]
+
+def btc_trend4h(ctx=None):
+    try: return trend(closes_cached('BTC-USDT', '4H', ctx))[0]
     except Exception: return None
 
 def lev_liq_max(entry, stop, mmr=MMR_DEFAULT, maxlev=LEVMAX):
@@ -419,7 +430,7 @@ def evaluate(setup, ctx):
         log_block(setup, fg, fw, ctx); return None, fw
     tf = E['trend_filter']; c4 = None
     if tf['enabled']:
-        c4 = [x[3] for x in candles(inst, tf['timeframe'])]
+        c4 = closes_cached(inst, tf['timeframe'], ctx)   # once per symbol per run (walk + pre-order re-check + BTC trend)
         tr = trend(c4)[0]
         want = 'up' if side == 'buy' else 'down'
         if tr != want: return None, f'{tf["timeframe"]} trend now {tr}, need {want}'
@@ -615,7 +626,7 @@ def _run_composite(setups, ctx, skipped, dry):
     plans are scored (composite_score) and tried best score first (unscorable last, ties in scan order). dry: the
     best plan is returned. live: each candidate is re-evaluated at the live price right before placing; a failed
     re-check or a refused leverage falls through to the next candidate. At most one entry per run."""
-    btc = btc_trend4h(); cands = []
+    btc = btc_trend4h(ctx); cands = []
     for i, s in enumerate(setups):
         s = dict(s, _rank=i + 1)
         try: plan, why = evaluate(s, ctx)

@@ -76,8 +76,21 @@ class TestScore(NoNetwork):
     def test_sum_and_missing_inputs(self):
         x = sc(10, 4.5, stop=99.0, btc="up")
         self.assertAlmostEqual(x["score"], x["s_target"] + x["s_gap"] + x["s_cost"] + x["s_btc"], places=3)
-        y = EX.composite_score("buy", 100.0, 95.0, 106.0, None, None, None, None)
-        self.assertEqual((y["s_target"], y["s_gap"]), (0, 0))
+        for bad in (None, 0, 0.0, -1.0, float("nan"), float("inf"), "x"):   # no valid 1H ATR: unscorable, not a 0 target term
+            y = EX.composite_score("buy", 100.0, 95.0, 106.0, bad, 102.0, 100.0, "up")
+            self.assertIsNone(y["score"], bad); self.assertIn("ATR", y["error"])
+        y = EX.composite_score("buy", 100.0, 95.0, 106.0, 1.0, None, None, None)   # missing EMA inputs alone: gap term 0
+        self.assertEqual(y["s_gap"], 0)
+    def test_missing_atr_ranks_below_scorable(self):
+        ok = dict(instId="A-USDT", side="buy", entry=100.0, stop=95.0, target=140.0, rr=8.0, atr1h=1.0, ema4h=(90.0, 100.0))   # poor but scorable
+        na = dict(ok, instId="B-USDT", target=106.0, rr=1.2, atr1h=None, ema4h=(102.0, 100.0))
+        self.assertIsNotNone(EX.score_plan(ok, "down")["score"]); self.assertIsNone(EX.score_plan(na, "up")["score"])
+        plans = {"B-USDT": na, "A-USDT": ok}
+        with mock.patch.object(EX, "evaluate", lambda s, ctx: (dict(plans[s["instId"]]), None)), \
+             mock.patch.object(EX, "btc_trend4h", return_value="up"), mock.patch.object(EX, "log_block", lambda *a, **k: None):
+            r = EX._run_composite([dict(instId="B-USDT", side="buy"), dict(instId="A-USDT", side="buy")], dict(warnings=[]), [], True)
+        self.assertEqual(r["plan"]["instId"], "A-USDT"); self.assertEqual([c["instId"] for c in r["candidates"]], ["A-USDT", "B-USDT"])
+        self.assertIsNone(r["candidates"][1]["score"])
 
 PLANS = {"HIRR-USDT": dict(entry=100.0, stop=95.0, target=140.0, atr1h=1.0, rr=8.0),   # 40 ATR target
          "GOOD-USDT": dict(entry=100.0, stop=95.0, target=106.0, atr1h=1.0, rr=1.2),
