@@ -8,7 +8,8 @@
       transfers not yet logged and appends them to DATA_DIR/logs/transfers_detect.jsonl. --record also adds them
       (source=blofin_bills, transfer_id kept). Needs a READ key for detect only.
 Writes hold DATA_DIR/transfers.lock and replace the file atomically (.prev kept).
-Dedupe: identical type + amount + ts_utc, or the same exchange transfer_id, in transfers.json AND in the detect log
+Dedupe: the same exchange transfer_id (compared as str), or identical type + amount (8 dp) + ts_utc when either row
+lacks a transfer_id (distinct ids are never merged), in transfers.json AND in the detect log
 (detect is idempotent: repeat runs never re-append a transfer already logged). Exit codes: 0 ok/dup, 2 bad args, 1 write/API fail, 4 lock busy.
 """
 import os, sys, json, time, fcntl, shutil, argparse, datetime as dt
@@ -30,6 +31,24 @@ def parse_ts(s):
     return t.astimezone(dt.timezone.utc)
 def iso(t): return t.strftime('%Y-%m-%dT%H:%M:%SZ')
 def key(r): return (r.get('type'), round(float(r.get('amount', 0)), 8), r.get('ts_utc'))
+
+def _tid(r):
+    t = r.get('transfer_id'); return str(t) if t not in (None, '') else None
+
+class Seen:
+    """Dedupe index: same transfer_id (as str) is a dup; type+amount+ts_utc is a dup only when one side has no id
+    (two rows with different exchange ids are distinct transfers even if type/amount/time coincide)."""
+    def __init__(self, rows=()):
+        self.ids, self.anon, self.keys = set(), set(), set()
+        for r in rows: self.add(r)
+    def add(self, r):
+        t = _tid(r); k = key(r); self.keys.add(k)
+        if t: self.ids.add(t)
+        else: self.anon.add(k)
+    def __contains__(self, r):
+        t = _tid(r)
+        if t: return t in self.ids or key(r) in self.anon
+        return key(r) in self.keys
 
 def make(type_, amount, ts_utc, source=None, note=None, transfer_id=None):
     if type_ not in ('deposit', 'withdrawal'): raise BadArgs('--type must be deposit or withdrawal')
@@ -57,12 +76,11 @@ def append(recs):
             except BlockingIOError:
                 if time.monotonic() - t0 >= LOCK_WAIT_S: raise LockBusy(f'{LOCK} busy for {LOCK_WAIT_S:g}s')
                 time.sleep(0.2)
-        tl = load_list(); keys = {key(r) for r in tl}; ids = {r.get('transfer_id') for r in tl if r.get('transfer_id')}
+        tl = load_list(); seen = Seen(tl)
         added, dups = [], []
         for r in recs:
-            if key(r) in keys or (r.get('transfer_id') and r['transfer_id'] in ids): dups.append(r); continue
-            tl.append(r); keys.add(key(r)); added.append(r)
-            if r.get('transfer_id'): ids.add(r['transfer_id'])
+            if r in seen: dups.append(r); continue
+            tl.append(r); seen.add(r); added.append(r)
         if added:
             p = state_path(); tmp = p + '.tmp'
             with open(tmp, 'w') as fh: json.dump(tl, fh, indent=1, default=str); fh.flush(); os.fsync(fh.fileno())
@@ -92,31 +110,31 @@ def fetch_bills(since_ms, get=None):
     return sorted(out, key=lambda r: r['ts_ms'])
 
 def log_keys():
-    """(keys, transfer_ids) already in the detect log; unreadable lines are ignored."""
-    ks, ids = set(), set()
+    """Seen index of rows already in the detect log; unreadable lines are ignored."""
+    seen = Seen()
     try:
         with open(detect_log()) as fh:
             for l in fh:
                 try: r = json.loads(l)
                 except Exception: continue
                 if not isinstance(r, dict): continue
-                ks.add(key(r))
-                if r.get('transfer_id'): ids.add(str(r['transfer_id']))
+                try: seen.add(r)
+                except Exception: continue
     except FileNotFoundError: pass
-    return ks, ids
+    return seen
 
 def detect(since, record=False, get=None):
     found = fetch_bills(int(parse_ts(since).timestamp() * 1000), get)
-    have = load_list(); keys = {key(r) for r in have}; ids = {r.get('transfer_id') for r in have if r.get('transfer_id')}
-    new = [r for r in found if key(r) not in keys and r.get('transfer_id') not in ids]
-    lk, li = log_keys()   # idempotent detect log: a transfer already in the log is never appended again
-    tolog = [r for r in new if key(r) not in lk and not (r.get('transfer_id') and r['transfer_id'] in li)]
+    have = Seen(load_list()); new = []
+    for r in found:
+        if r not in have: new.append(r); have.add(r)
+    logged = log_keys()   # idempotent detect log: a transfer already in the log is never appended again
+    tolog = [r for r in new if r not in logged]
     if tolog:
         with open(detect_log(), 'a') as fh:
             for r in tolog:
                 fh.write(json.dumps(dict(r, detected_utc=iso(dt.datetime.now(dt.timezone.utc)))) + '\n')
-                lk.add(key(r))
-                if r.get('transfer_id'): li.add(r['transfer_id'])
+                logged.add(r)
     added = append(new)[0] if (record and new) else []
     return found, new, added
 

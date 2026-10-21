@@ -71,7 +71,27 @@ class TestDetectDedupe(NoNetwork):
         self.assertEqual(len(ids), len(set(ids))); self.assertEqual(len(ids), 2)
 
     def test_log_keys_empty_when_missing(self):
-        self.assertEqual(transfers.log_keys(), (set(), set()))
+        lk = transfers.log_keys(); self.assertEqual((lk.ids, lk.keys), (set(), set()))
+
+    def test_distinct_ids_same_type_amount_time_both_kept(self):
+        global BILLS
+        old = BILLS; BILLS = [dict(old[1]), dict(old[1], transferId="fake-0003")]
+        try: f, n, a = transfers.detect(SINCE, True, get)
+        finally: BILLS = old
+        self.assertEqual(len(n), 2); self.assertEqual(len(a), 2); self.assertEqual(len(lines()), 2)
+
+    def test_int_id_in_log_matches_str_id(self):
+        write_log(dict(type="deposit", amount=1.0, ts_utc="2000-01-01T00:00:00Z", transfer_id=7))
+        global BILLS
+        old = BILLS; BILLS = [dict(old[0], transferId="7")]
+        try: transfers.detect(SINCE, False, get)
+        finally: BILLS = old
+        self.assertEqual(len(lines()), 1)
+
+    def test_float_amount_noise_still_dedupes(self):
+        write_log(dict(type="deposit", amount=148.696574580001, ts_utc="2026-01-01T00:00:00Z"))
+        transfers.detect(SINCE, False, get)
+        self.assertEqual(len(lines()), 2)
 
     def test_state_add_stays_deduped(self):
         r = lambda: transfers.make("deposit", 5, "2026-01-02T00:00:00Z")
