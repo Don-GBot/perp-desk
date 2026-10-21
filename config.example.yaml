@@ -138,7 +138,7 @@ entry:
   # record with no matching live position, or a pruned record whose close line was not found yet.
   unresolved_record_block: true
   # Hard filters, every trade (scaled or not), logged as block lines. 0 turns either off.
-  # rr_cap: skip if the planned price R:R is above this (far targets rarely fill).
+  # rr_cap: skip if the planned price R:R is above this.
   rr_cap_max: 8
   # cost_heavy: skip if fee_share (round-trip taker fees / stop-out loss, the fee_heavy share) is >= this.
   cost_heavy_max_share: 0.12

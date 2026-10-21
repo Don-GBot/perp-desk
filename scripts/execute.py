@@ -21,7 +21,7 @@ Per run:
     1H trend aligned with the side (entry.trend_1h, trend1h.py; flat blocks both sides, a data error skips);
     sizing (fit_size): scaled down to the binding limit, skip fee_heavy / below_min_size / liq / cap_risk.
   - Ranking (entry.composite, on): the passing setups are scored by composite_score and tried best score first;
-    each one after the first is re-checked at the live price just before its order. composite off: scan order (R:R).
+    each one is re-checked at the live price just before its order. composite off: scan order (R:R).
   - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop. A failed re-check or a
     refused leverage falls through to the next candidate; at most one entry per run.
 Sizing: risk_per_trade_pct is a MAXIMUM. A clean stop-out of a planned entry loses about risk_per_trade_pct of equity
@@ -605,14 +605,15 @@ def _skip(s, why, ctx, skipped):
 
 def score_plan(plan, btc):
     try:
-        e1, e2 = plan.get('ema4h') or (None, None)
+        if not plan.get('ema4h'): return dict(score=None, error='4H EMA unreadable')   # unscorable: ranked last
+        e1, e2 = plan['ema4h']
         return composite_score(plan['side'], plan['entry'], plan['stop'], plan['target'], plan['atr1h'], e1, e2, btc)
     except Exception as e: return dict(score=None, error=f'{type(e).__name__}: {str(e)[:120]}')
 
 def _run_composite(setups, ctx, skipped, dry):
     """Composite ranking (entry.composite): every setup goes through evaluate() (all checks, no order); the passing
     plans are scored (composite_score) and tried best score first (unscorable last, ties in scan order). dry: the
-    best plan is returned. live: the candidate is re-evaluated at the live price right before placing; a failed
+    best plan is returned. live: each candidate is re-evaluated at the live price right before placing; a failed
     re-check or a refused leverage falls through to the next candidate. At most one entry per run."""
     btc = btc_trend4h(); cands = []
     for i, s in enumerate(setups):
@@ -627,12 +628,11 @@ def _run_composite(setups, ctx, skipped, dry):
     if dry:
         if order: return dict(ok=True, dry=True, plan=order[0]['plan'], score=order[0]['sc'], **base)
         return dict(ok=False, dry=True, why='no setup passed the checks', **base)
-    for n, c in enumerate(order):
-        s = c['s']; plan = c['plan']
-        if n:   # the first plan is fresh; later ones are re-checked at the live price
-            try: plan, why = evaluate(s, ctx)
-            except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
-            if plan is None: _skip(s, why, ctx, skipped); continue
+    for c in order:
+        s = c['s']
+        try: plan, why = evaluate(s, ctx)   # re-check at the live price right before the order (the walk took time)
+        except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
+        if plan is None: _skip(s, why, ctx, skipped); continue
         out = place(plan); out.update(skipped=skipped, score=c['sc'], candidates=ranked)
         if ctx['warnings']: out.setdefault('warnings', []).extend(ctx['warnings'])
         if out.get('ok') or out.get('order_resp') is not None: return out   # accepted, rejected or unknown: stop here

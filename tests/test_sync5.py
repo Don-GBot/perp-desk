@@ -89,7 +89,7 @@ class TestWalk(NoNetwork):
         def ev(s, ctx):
             inst = s["instId"]; self.calls.append(inst)
             if inst == "FAIL-USDT": return None, "R:R 1.00 < 3"
-            if inst in self.recheck_fail and self.calls.count(inst) > 1: return None, "R:R 2.50 < 3"
+            if inst in self.recheck_fail and self.calls.count(inst) > 1: return None, "R:R 2.50 < 3"   # passes the walk, fails the pre-order re-check
             return dict(instId=inst, side="buy", ema4h=(102.0, 100.0), **PLANS[inst]), None
         def pl(plan):
             self.places.append(plan["instId"])
@@ -113,6 +113,8 @@ class TestWalk(NoNetwork):
     def test_live_one_entry(self):
         r = EX.run(self.setups, self.ts)
         self.assertEqual(self.places, ["GOOD-USDT"]); self.assertEqual(r["score"]["score"], r["candidates"][0]["score"])
+        self.assertEqual(self.calls.count("GOOD-USDT"), 2)   # top candidate re-checked right before its order
+        self.assertEqual(self.calls.count("HIRR-USDT"), 1)
     def test_live_falls_through_on_failed_leverage_and_recheck(self):
         self.lev_fail = {"GOOD-USDT"}; self.recheck_fail = {"MID-USDT"}
         r = EX.run(self.setups, self.ts)
@@ -127,6 +129,8 @@ class TestWalk(NoNetwork):
                 "buy", p["entry"], p["stop"], p["target"], p["atr1h"], 102.0, 100.0, b)):
             r = EX.run(self.setups, self.ts, dry=True)
         self.assertEqual(r["candidates"][-1]["instId"], "GOOD-USDT")
+    def test_missing_ema_is_unscorable(self):
+        self.assertIsNone(EX.score_plan(dict(PLANS["GOOD-USDT"], side="buy", ema4h=None), "up")["score"])
     def test_composite_off_is_scan_order(self):
         with mock.patch.object(EX, "COMPOSITE", False):
             r = EX.run(self.setups, self.ts, dry=True)

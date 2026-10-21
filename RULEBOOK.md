@@ -52,7 +52,7 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Rule | Value |
 |---|---|
 | Minimum R:R | ≥ `min_rr` (3) at the live price (ask for long, bid for short), price-only: (target − entry) / (entry − stop), mirrored for shorts, stop and target rounded to tick. Fees are not deducted from R:R; sizing covers them. |
-| R:R cap | `entry.rr_cap_max` (8): skip `rr_cap` if the planned price R:R is above 8 (far targets rarely fill). 0 turns it off. Block line logged. |
+| R:R cap | `entry.rr_cap_max` (8): skip `rr_cap` if the planned price R:R is above 8. 0 turns it off. Block line logged. |
 | Cost-heavy skip | `entry.cost_heavy_max_share` (0.12): skip `cost_heavy` if `fee_share` (round-trip taker fees / stop-out loss, the same share as `fee_heavy`) is ≥ 12%. Applies to every trade, scaled or not. 0 turns it off. Block line logged. |
 | Side geometry | After rounding: stop < entry < target for longs, target < entry < stop for shorts. |
 | Fresh scan | `scan.json` no older than `max_scan_age_min` (35). |
@@ -78,7 +78,7 @@ Score = sum of four terms (higher is better); ties keep scan order, a setup that
 - **4H EMA gap** (EMA fast − slow of `trend_filter`, 20/50, in % of EMA slow, in the trade direction): + min(gap, 3) / 3; above 3% (stretched) −1/3 per % beyond 3 (`gap_full_pct`, `gap_over_pen`). A gap against the trade scores negative.
 - **Cost:** −0.25 per percentage point of `fee_share` above 8% (`fee_share_free`, `fee_share_pen`); −1.0 at the 12% `cost_heavy` wall.
 - **BTC 4H trend:** +0.25 if BTC-USDT's 4H trend agrees with the side (`btc_bonus`); unreadable = no bonus.
-The 1H trend and the news gate stay hard gates, not score terms. The result carries `candidates` (scored list) and `score`.
+The 1H trend and the news gate stay hard gates, not score terms. Missing 4H EMA data = unscorable. In a live run each candidate is re-checked at the live price just before its order. The result carries `candidates` (scored list) and `score`.
 
 ### Setup definition (`scan.py`)
 - Long: entry = ask. Stop = the lower of (lowest low of the last 12 1H candles − 0.25 ATR) and (entry − 1 ATR). Target = highest high of the last 60 4H candles.
