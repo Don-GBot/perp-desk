@@ -170,8 +170,10 @@ def ema4h(inst, closes4h=None):
     return ema(c, tf['ema_fast'])[-1], ema(c, tf['ema_slow'])[-1]
 
 def closes_cached(inst, bar, ctx=None):
-    """Closes of inst/bar, fetched at most once per run when ctx is given (run-scoped cache in ctx['_closes'])."""
-    cache = ctx.setdefault('_closes', {}) if ctx is not None else {}
+    """Closes of inst/bar, fetched at most once per first pass when ctx is given (cache in ctx['_closes']);
+    ctx['_fresh'] (the pre-order re-check) bypasses the cache."""
+    if ctx is None or ctx.get('_fresh'): return [x[3] for x in candles(inst, bar)]   # pre-order re-check: always fresh
+    cache = ctx.setdefault('_closes', {})
     if (inst, bar) not in cache: cache[(inst, bar)] = [x[3] for x in candles(inst, bar)]
     return cache[(inst, bar)]
 
@@ -423,18 +425,23 @@ def evaluate(setup, ctx):
     risk = abs(entry - stop)
     rr = price_rr(side, entry, stop, target)
     if rr < MINRR: return None, f'R:R {rr:.2f} < {MINRR:g}'
-    a1 = atr(candles(inst, '1H'))
+    lim = int(config.CFG['scan']['candles_limit']); share1h = TREND1H and T1.BAR == '1H'
+    try: c1 = candles(inst, '1H', max(lim, T1.BARS) if share1h else lim)   # one 1H fetch, shared by ATR and the 1H trend
+    except Exception as e: return None, f'atr unreadable: 1H candles error: {str(e)[:120]}'
+    try: a1 = atr(c1[-lim:])
+    except Exception as e: return None, f'atr unreadable: {str(e)[:120]}'
+    if not _pos_finite(a1): return None, f'atr unreadable: 1H ATR {a1!r} (missing, 0 or non-finite)'
     if risk < ATR_FLOOR * a1: return None, f'stop {risk/a1:.2f}x ATR < {E["min_stop_atr"]:g}'
     fg, fw = filter_gate(entry, stop, rr)
     if fg:
         log_block(setup, fg, fw, ctx); return None, fw
     tf = E['trend_filter']; c4 = None
     if tf['enabled']:
-        c4 = closes_cached(inst, tf['timeframe'], ctx)   # once per symbol per run (walk + pre-order re-check + BTC trend)
+        c4 = closes_cached(inst, tf['timeframe'], ctx)   # once per symbol in the first pass (shared with BTC trend)
         tr = trend(c4)[0]
         want = 'up' if side == 'buy' else 'down'
         if tr != want: return None, f'{tf["timeframe"]} trend now {tr}, need {want}'
-    tw, t1d = trend1h_check(inst, side)
+    tw, t1d = trend1h_check(inst, side, c1[-T1.BARS:] if share1h else None)
     if tw:
         log_block(setup, '1h_trend (data error)' if 'data error' in tw else '1h_trend', tw, ctx, dict(detail=t1d))
         return None, tw
@@ -639,6 +646,7 @@ def _run_composite(setups, ctx, skipped, dry):
     if dry:
         if order: return dict(ok=True, dry=True, plan=order[0]['plan'], score=order[0]['sc'], **base)
         return dict(ok=False, dry=True, why='no setup passed the checks', **base)
+    ctx['_fresh'] = True   # the re-check below refetches market data
     for c in order:
         s = c['s']
         try: plan, why = evaluate(s, ctx)   # re-check at the live price right before the order (the walk took time)

@@ -63,12 +63,17 @@ class TestTrend1h(GateBase):
         self.assertIsNone(plan); self.assertEqual(why, "1h_trend (down)")
         l = rd(BL.log_path()); self.assertEqual([(x["gate_reason"], x["mode"], x["source"]) for x in l], [("1h_trend", "live", "execute")])
     def test_data_error_fails_closed(self):
-        def broken(inst, bar, limit=None):
-            if bar == "1H" and limit == trend1h.BARS: raise RuntimeError("candles 503")
+        def short(inst, bar, limit=None):   # enough 1H bars for ATR, too few for the 1H trend EMAs
+            return fake_candles_up(inst, bar)[-30:] if bar == "1H" else fake_candles_up(inst, bar)
+        with mock.patch.object(EX, "candles", short):
+            plan, why = EX.evaluate(SETUP, self.ctx)
+        self.assertIsNone(plan); self.assertEqual(why, "1h_trend (data error)")
+        def broken(inst, bar, limit=None):   # the shared 1H fetch fails: rejected, never raises
+            if bar == "1H": raise RuntimeError("candles 503")
             return fake_candles_up(inst, bar)
         with mock.patch.object(EX, "candles", broken):
             plan, why = EX.evaluate(SETUP, self.ctx)
-        self.assertIsNone(plan); self.assertEqual(why, "1h_trend (data error)")
+        self.assertIsNone(plan); self.assertIn("atr unreadable", why)
     def test_flag_off(self):
         def mixed(inst, bar, limit=None): return fake_candles_up(inst, bar) if bar == "4H" else fake_candles_down(inst, bar)
         with mock.patch.object(EX, "candles", mixed), mock.patch.object(EX, "TREND1H", False):

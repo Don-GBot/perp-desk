@@ -54,11 +54,25 @@ class TestRankingEndToEnd(NoNetwork):
         self.assertEqual(self.places, ["WIDE-USDT"])                            # top composite placed, one entry per run
         self.assertEqual(r["score"]["score"], cands[0]["score"]); self.assertEqual(self.posts, [])
         four = {k[0]: n for k, n in self.fetch.items() if k[1] == "4H"}
-        self.assertEqual(four, {"TIGHT-USDT": 1, "MID-USDT": 1, "WIDE-USDT": 1, "BTC-USDT": 1}, self.fetch)   # once per symbol, incl. re-check
+        self.assertEqual(four, {"TIGHT-USDT": 1, "MID-USDT": 1, "WIDE-USDT": 2, "BTC-USDT": 1}, self.fetch)   # first pass once each, fresh re-check for the winner
+        one = {k[0]: n for k, n in self.fetch.items() if k[1] == "1H"}
+        self.assertEqual(one, {"TIGHT-USDT": 1, "MID-USDT": 1, "WIDE-USDT": 2}, self.fetch)   # one 1H fetch per evaluate (ATR + 1H trend)
 
     def test_btc_setup_shares_btc_trend_fetch(self):
         r = EX.run([dict(instId="BTC-USDT", side="buy", stop=101500, target=113000)], T.iso_ago(0))
         self.assertTrue(r.get("ok"), r); self.assertEqual(self.places, ["BTC-USDT"])
-        self.assertEqual(self.fetch[("BTC-USDT", "4H")], 1, self.fetch)
+        self.assertEqual(self.fetch[("BTC-USDT", "4H")], 2, self.fetch)   # BTC trend shares the first pass; re-check is fresh
+        self.assertEqual(self.fetch[("BTC-USDT", "1H")], 2, self.fetch)
+
+    def test_bad_atr_rejected_never_placed(self):
+        for bad in (0.0, float("nan"), float("inf")):
+            self.places.clear()
+            with mock.patch.object(EX, "atr", return_value=bad):
+                r = EX.run(self.setups, T.iso_ago(0))
+            self.assertFalse(r.get("ok"), r); self.assertEqual(self.places, [])
+            self.assertTrue(all("atr unreadable" in k["why"] for k in r["skipped"]), r["skipped"])
+        with mock.patch.object(EX, "atr", side_effect=ValueError("not enough candles for ATR14: 3")):
+            plan, why = EX.evaluate(dict(self.setups[0]), dict(equity=1000.0, avail=1000.0, pos=[], ins=INS, warnings=[]))
+        self.assertIsNone(plan); self.assertIn("atr unreadable", why)
 
 if __name__ == "__main__": unittest.main()
