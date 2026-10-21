@@ -141,7 +141,7 @@ Script-written logs (logging only; none of them changes a stop, order or close):
 
 ---
 
-## 4. News analyst
+## 3. News analyst
 | Rule | Value |
 |---|---|
 | Role | Rate each pair bullish / bearish / neutral with confidence low / medium / high, sources and the real rating time. |
@@ -152,7 +152,7 @@ Script-written logs (logging only; none of them changes a stop, order or close):
 
 ---
 
-## 5. Manager
+## 4. Manager
 Audits the bots against logs and this rulebook. See `prompts/manager.md`.
 
 ## Operating principles
