@@ -1,4 +1,4 @@
-"""Universe tiers, ONE definition shared by scan.py, execute.py, scanner.py, shadow_variants.py and shadow_swap.py.
+"""Universe tiers, ONE definition shared by scan.py, execute.py and scanner.py.
 
 config.yaml -> scan:
   universe_ext_enabled false: scan.py ranks the top `universe_size` USDT perps by 24h quote volume.

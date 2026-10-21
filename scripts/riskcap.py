@@ -1,4 +1,4 @@
-"""Risk-based position caps (config.yaml -> risk.risk_caps). Used by execute.py and mirrored by the shadow books.
+"""Risk-based position caps (config.yaml -> risk.risk_caps). Used by execute.py.
 Fail closed: if any open position's risk can't be computed, callers fall back to the slot caps (risk.max_open /
 risk.max_per_direction).
 

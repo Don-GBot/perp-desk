@@ -11,7 +11,7 @@ An agent that wakes up re-reads its instructions, its memory and often its whole
 ## Put deterministic work in scripts
 If the answer is arithmetic, write a script. Scanning, sizing, leverage, filters, the news gate and position management (stops, break-even, hard cut, closes) are all scripts. The agent runs them and reads a short result.
 
-The shadow swap logger has no LLM at all. It runs from cron and costs nothing. A human or the Manager reads its log weekly.
+The plain scripts (scan, the optional standalone scanner) have no LLM at all and cost nothing.
 
 ## Avoid agent-to-agent messaging
 Messages between agents wake the receiver, and each message lands in its chat history forever. The news analyst used to message the Executor every 4 hours. Now it writes `fundamentals.json` and the Executor reads it when it runs anyway.

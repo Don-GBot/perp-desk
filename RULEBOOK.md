@@ -16,7 +16,7 @@ The single list of rules for perp-desk. Values live in `config.yaml`; this file 
 | T4 | Only the Executor places orders. `scan.py` / `scan.json` is the only setup source. |
 | T5 | Pipeline: the alerts scanner writes `flags_latest.json`; the news analyst writes `fundamentals.json`; the Executor reads both plus `scan.json` and applies its own risk rules. Agents do not message each other. Shared files are the interface. |
 | T6 | Scanner flags are info only. They are recorded, never used to enter, size, skip or exit. |
-| T7 | Swaps are shadow only. `shadow_swap.py` makes GET calls only. No bot closes a trade to swap into another until the owner approves it. |
+| T7 | No swaps. No bot closes a trade to swap into another without the owner's approval. |
 | T8 | Schedules: see `docs/scheduling.md`. Small start-time drift is acceptable. |
 | T9 | Quiet by default. The Executor reports opens, closes, adjustments and errors. The others report only new, urgent items or failures. |
 | T10 | Orders are real. Only the Executor's environment holds trading keys. All order actions go through `execute.py` and `manage.py`, which hold a shared lock so two actions never overlap. |
@@ -125,7 +125,7 @@ Either way, manual positions block bot entries on that pair and count toward the
 | Fail open | If no rating is younger than `fail_open_after_hours` (~5h), or the file is missing, the gate allows entries. |
 | Enforced by | `execute.py`, on every candidate, together with the macro window when enabled. |
 
-- Fundamentals freshness is one setting, `news_gate.fresh_hours` (4.5h), for the gate, the opposing-rating check, `no_fundamentals` and shadow swap. The cooldown (4h) is separate.
+- Fundamentals freshness is one setting, `news_gate.fresh_hours` (4.5h), for the gate, the opposing-rating check, and `no_fundamentals`. The cooldown (4h) is separate.
 
 ### Logging
 Every run, open position and closed trade goes in `state.json`. Each new entry records its news rating and `scanner_flag` (that pair's flags within the last 2 closed 15m candles, or `[]`).
@@ -138,33 +138,6 @@ Script-written logs (logging only; none of them changes a stop, order or close):
 | `closed_trades.jsonl` | `manage.py` | One line per closed bot position, matched to the exchange positions history by positionId, else createTime within 120 s (one history row per record). |
 | funding fields | `manage.py` | `funding_paid` / `funding_n` on open bot records and closed-trade lines (exchange funding-fee bills, read-only). |
 | `transfers.json` | `transfers.py` | Owner deposits and withdrawals, so equity changes are not read as PnL. `detect --since` lists futures-account transfers from the exchange bills (read-only). |
-
----
-
-## 3. Shadow swap logger (`scripts/shadow_swap.py`)
-
-Read only. No LLM. Runs from plain cron.
-
-| Rule | Value |
-|---|---|
-| Candidates | `scan.json` setups that pass the same entry filters as the Executor and are ≤ `max_age_min` (60) old. |
-| Standard rule | PASS iff candidate EV ≥ (old remaining profit + close fee) × `hurdle_mult` (1.2) AND candidate R:R ≥ old R:R + `rr_edge` (0.5). |
-| Break-even rule | Old stop at or past entry: PASS iff candidate EV ≥ old remaining profit × 1.2. R:R rule skipped. |
-| Margin | The candidate must fit the margin rules after freeing the old trade's margin. |
-| Output | One JSON record per decision plus a SUMMARY per cycle. |
-| Go-live | Only after the Manager's weekly go/no-go and the owner's approval. |
-
----
-
-## 3b. Shadow filter variants (`scripts/shadow_variants.py`)
-
-- Own-book cooldown mirrors the live bot: a scratch requires BE to have fired, either exit at/beyond the BE stop (exact price, no slip tolerance in the shadow book) or a fee-inclusive loss under 0.5R. A stop-out before BE always starts the cooldown. Stats recompute R from each row's entry/exit/initial_stop.
-
-Read only. No LLM. Runs from plain cron or as its own loop. Every new `scan.json` is walked by several virtual books
-with different filters (BASELINE = live rules, BASELINE_NO1H, V_1H, V_ATR15, V_RR10, STOCKS_ONLY, V_SLOWTREND, V_CROWD;
-see `config.example.yaml` -> `shadow_variants`). Each book keeps its own caps and tracks its entries to TP / SL / BE /
-trail / hard cut on 1m bars. `--stats` grades the CLOSE rows per book. A variant goes live only after the Manager's review
-and the owner's approval, as a config change.
 
 ---
 
@@ -201,4 +174,3 @@ Audits the bots against logs and this rulebook. See `prompts/manager.md`.
 - **Funding is not in R:R or the risk cap** (taker fees and a slippage buffer are). It is logged per position only.
 - **Setup choice:** `execute.py` takes the first (best R:R) setup unless the agent passes `--inst`.
 - **Ownership needs timestamps.** A position the bot opened is recognized by create time (within 120 s of the record or of a bot-prefixed opening order). If the exchange reports a create time far from the order time, the bot treats the position as manual.
-- **Scan freshness (35 min) and shadow candidate age (60 min) differ.**

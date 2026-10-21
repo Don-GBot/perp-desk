@@ -127,7 +127,7 @@ def lev_liq_max(entry, stop, mmr=MMR_DEFAULT, maxlev=LEVMAX):
     return max(ok) if ok else None
 
 def fit_size(equity, avail, entry, stop, cv, lot, mins, maxlev=LEVMAX, mmr=MMR_DEFAULT, risk_cap=None):
-    """Shared sizing (execute, shadow_variants, shadow_swap). Returns dict(size, size_full, lev, cap, notional, scaled_down,
+    """Sizing. Returns dict(size, size_full, lev, cap, notional, scaled_down,
     scaled_by, risk_pct_actual, fee_share, gate, why). gate None = may proceed, else 'below_min_size' | 'no_leverage_fit' |
     'fee_heavy' | 'liq' | 'cap_risk' | 'below_min_risk'. Start: the full-risk size (size_for). Scale DOWN only, lot-rounded:
       1. risk_cap (USDT, risk-cap headroom): size <= risk_cap / (planned loss per contract); below min -> cap_risk
@@ -215,7 +215,7 @@ def pair_positions(inst):
 def instruments():
     return {x['instId']: x for x in bf.public('/api/v1/market/instruments')['data']}
 
-# ---- shared gates (also used by shadow_swap.py / shadow_variants.py) ---------------------------
+# ---- gates -------------------------------------------------------------------------------------
 def stockperp_check(inst, ins=None):
     """(reason, detail) if inst is a stock perp or cannot be classified (fail closed), else (None, how). No-op when off."""
     if not STOCKPERP: return None, None

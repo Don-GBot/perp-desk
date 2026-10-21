@@ -1,4 +1,4 @@
-"""Stock-perp detection: ONE definition for execute.py (entry.stock_perp_block), shadow_variants.py and shadow_swap.py.
+"""Stock-perp detection: ONE definition for execute.py (entry.stock_perp_block).
 Rule: no new entries on stock perps (equities, ETFs/index, tokenized stocks).
 A pair is a stock perp if it is in STOCK_PERPS (maintained list) OR Blofin GET /api/v1/market/instruments assetClass is in
 STOCK_CLASSES ('Stocks', 'Indices'), so new stock listings are caught. 'Commodities' (oil, gas) and 'Crypto' are not blocked.

@@ -1,13 +1,12 @@
 # Architecture
 
-Three agents, six scripts (plus three small helper modules), and a handful of shared files. Agents never message each other. They read and write files.
+Three agents, five scripts (plus small helper modules), and a handful of shared files. Agents never message each other. They read and write files.
 
 ```mermaid
 flowchart LR
     subgraph Scripts["Deterministic scripts (no LLM)"]
         SCAN["scan.py<br/>setup scanner"]
         ALERT["scanner.py<br/>alerts + flags"]
-        SHADOW["shadow_swap.py<br/>read-only, cron"]
         EXE["execute.py<br/>opens one trade"]
         MAN["manage.py<br/>stops, BE, hard cut, close"]
         NG["news_gate.py"]
@@ -23,7 +22,6 @@ flowchart LR
         FJ[(fundamentals.json)]
         ST[(state.json)]
         PO[(exec_last.json<br/>bot_positions.json)]
-        SL[(logs/shadow_swap.jsonl)]
         AL[(scanner_log.jsonl)]
     end
     EX[(Blofin API)]
@@ -45,11 +43,8 @@ flowchart LR
     EXE --> PO
     PO --> MAN
     EXEC --> ST
-    SJ --> SHADOW
-    SHADOW --> SL
     ST --> MGR
     PO --> MGR
-    SL --> MGR
     AL --> MGR
     FJ --> MGR
 ```
@@ -65,7 +60,6 @@ flowchart LR
 | `scripts/news_gate.py` | script | `fundamentals.json` | nothing | no |
 | `scripts/universe.py` | helper | config, `fundamentals.json` | nothing | no |
 | `scripts/riskcap.py` | helper | positions + TP/SL passed in | nothing | no |
-| `scripts/shadow_swap.py` | script | `scan.json`, `state.json`, account (GET) | `logs/shadow_swap.*` | never |
 | Executor | agent | all of the above | `state.json` | yes, via `execute.py` and `manage.py` |
 | News analyst | agent | `scan.json` universe, the web | `fundamentals.json` | no |
 | Manager | agent | every log | reports to the human | no |
@@ -84,5 +78,4 @@ flowchart LR
 4. Config is validated on load (risk 0–10%, hard cut ≥ risk, and more). Bad values stop the run.
 5. `execute.py` applies the news gate and macro window to every candidate itself. If an order request times out, it looks the order up by client order id before deciding.
 6. `manage.py` only treats a position as the bot's when a record or the order history matches its creation time. Stale records are pruned each run.
-7. `shadow_swap.py` only ever makes GET calls.
-8. Use an API key with READ + TRADE only: no transfer, no withdrawal. Bind it to your IP.
+7. Use an API key with READ + TRADE only: no transfer, no withdrawal. Bind it to your IP.

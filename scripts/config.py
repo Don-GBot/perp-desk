@@ -40,11 +40,8 @@ DEFAULTS = {
     "macro_window": {"enabled": False, "hours_before": 2, "hours_after": 1},
     "scanner": {"move_alert_pct": 5, "realert_min_pts": 3, "realert_frac": 0.25, "memory_hours": 24,
                 "coil_ratio": 0.5, "coil_top": 3, "flag_min_quote_vol_usd": 1000000, "flag_bar": "15m"},
-    "shadow_swap": {"hurdle_mult": 1.2, "rr_edge": 0.5, "max_age_min": 35, "slots": [9, 24, 39, 54]},
     "logging": {"blocked_setups": True, "funding": True, "run_records": True, "log_all_skips": True,
                 "scheduled_dry_window_s": 1800},
-    "shadow_variants": {"enabled": True, "poll_sec": 20, "rr_cap": 10, "atr_widen": 1.5, "slowtrend_z_min": 1.0,
-                        "crowd_n": 2, "crowd_hours": 72, "rr2_min": 2.0},
     "ops": {"freeze_windows": ["05-15", "35-45"], "swap_timeout_s": 180, "swap_poll_s": 2},
 }
 
@@ -172,10 +169,6 @@ def validate(cfg):
     if t1["bar"] not in ("15m", "30m", "1H", "2H", "4H"): raise ConfigError(f"entry.trend_1h.bar not supported: {t1['bar']!r}")
     for k in ("blocked_setups", "funding", "run_records", "log_all_skips"): _bool(cfg, "logging." + k)
     _num(cfg, "logging.scheduled_dry_window_s", 0)
-    _bool(cfg, "shadow_variants.enabled"); _num(cfg, "shadow_variants.poll_sec", 1); _num(cfg, "shadow_variants.rr_cap", 0, lo_incl=False)
-    _num(cfg, "shadow_variants.atr_widen", 0, lo_incl=False); _num(cfg, "shadow_variants.slowtrend_z_min", 0)
-    _num(cfg, "shadow_variants.crowd_n", 1, integer=True); _num(cfg, "shadow_variants.crowd_hours", 1)
-    _num(cfg, "shadow_variants.rr2_min", 0, lo_incl=False)
     tf = cfg["entry"]["trend_filter"]
     _bool(cfg, "entry.trend_filter.enabled")
     f = _num(cfg, "entry.trend_filter.ema_fast", 1, integer=True); s = _num(cfg, "entry.trend_filter.ema_slow", 1, integer=True)
@@ -203,14 +196,10 @@ def validate(cfg):
     for k in ("move_alert_pct", "realert_min_pts", "memory_hours", "coil_ratio"): _num(cfg, "scanner." + k, 0, lo_incl=False)
     _num(cfg, "scanner.realert_frac", 0); _num(cfg, "scanner.coil_top", 0, integer=True); _num(cfg, "scanner.flag_min_quote_vol_usd", 0)
     if not str(cfg["scanner"]["flag_bar"]).endswith(("m", "H")): raise ConfigError("scanner.flag_bar must look like 15m or 1H")
-    _num(cfg, "shadow_swap.hurdle_mult", 0, lo_incl=False); _num(cfg, "shadow_swap.rr_edge", 0); _num(cfg, "shadow_swap.max_age_min", 0, lo_incl=False)
     _num(cfg, "ops.swap_timeout_s", 0); _num(cfg, "ops.swap_poll_s", 0, lo_incl=False)
     fw = cfg["ops"]["freeze_windows"]
     if not isinstance(fw, list) or any(not isinstance(x, str) or len(x.split("-")) != 2 or not all(p.isdigit() and 0 <= int(p) <= 60 for p in x.split("-")) or int(x.split("-")[0]) >= int(x.split("-")[1]) for x in fw):
         raise ConfigError('ops.freeze_windows must be a list of "MM-MM" minute ranges, e.g. ["05-15", "35-45"]')
-    sl = cfg["shadow_swap"]["slots"]
-    if not isinstance(sl, list) or not sl or any(isinstance(x, bool) or not isinstance(x, int) or not 0 <= x <= 59 for x in sl):
-        raise ConfigError("shadow_swap.slots must be a non-empty list of minutes 0-59")
     return cfg
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -204,7 +204,7 @@ management:
 news_gate:
   enabled: true
   # A rating is "fresh" for this many hours after its ts_utc (the real rating time). The ONE freshness setting:
-  # the news gate, the opposing-rating block, the ext-tier no_fundamentals check and shadow_swap all use it.
+  # the news gate, the opposing-rating block, and the ext-tier no_fundamentals check all use it.
   # (risk.cooldown_hours is separate.)
   fresh_hours: 4.5
   # Only fresh opposing ratings with one of these confidences block an entry.
@@ -240,15 +240,6 @@ scanner:
   flag_bar: 15m
 
 # ---------------------------------------------------------------------------
-# Shadow swap logger (scripts/shadow_swap.py, read-only)
-# ---------------------------------------------------------------------------
-shadow_swap:
-  hurdle_mult: 1.2           # candidate EV must beat (remaining profit + close fee) x this
-  rr_edge: 0.5               # and candidate R:R must beat old R:R + this
-  max_age_min: 35            # ignore scan setups older than this (= entry.max_scan_age_min)
-  slots: [9, 24, 39, 54]     # minutes past the hour for the built-in scheduler
-
-# ---------------------------------------------------------------------------
 # Logging only (never changes a stop, order or close)
 # ---------------------------------------------------------------------------
 logging:
@@ -267,27 +258,6 @@ logging:
   # scheduled routine's decision run: its block lines go to the LIVE log with mode "scheduled_dry". Ad-hoc dry
   # runs stay in the dry log. Logging only.
   scheduled_dry_window_s: 1800
-
-# ---------------------------------------------------------------------------
-# Shadow filter variants (scripts/shadow_variants.py, read-only, never trades)
-# ---------------------------------------------------------------------------
-# Each new scan.json is walked by several virtual books with different filters, so rule changes can be
-# compared on the same setups before they go live. Books: BASELINE (live rules), BASELINE_NO1H (live
-# rules without the 1h gate), V_1H (1h gate always on), V_ATR15 (stop widened to >= atr_widen x ATR),
-# V_RR10 (skip setups with R:R >= rr_cap), STOCKS_ONLY (stock perps only), V_SLOWTREND (time-series
-# momentum z over 168h/720h must agree with the side, |z| > slowtrend_z_min), V_CROWD (no longs in the
-# crowd_n pairs with the highest average funding over crowd_hours, no shorts in the crowd_n lowest), V_RR2
-# (live rules but gross min R:R rr2_min; also walks the scan's rejected rr2_min <= R:R < min_rr setups, rebuilt
-# with the scan geometry; rows tagged rr_bucket). Every book follows the live universe tiers, risk caps and sizing.
-shadow_variants:
-  enabled: true
-  poll_sec: 20
-  rr_cap: 10
-  atr_widen: 1.5
-  slowtrend_z_min: 1.0
-  crowd_n: 2
-  crowd_hours: 72
-  rr2_min: 2.0
 
 # ---------------------------------------------------------------------------
 # Ops (scripts/swapguard.py: safe file swaps / restarts while the bot is scheduled)

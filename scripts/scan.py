@@ -98,7 +98,7 @@ def universe_ranked(top=None, max_spread_pct=None):
 
 def geometry(inst, bid, ask, h1, h4):
     """The scan's setup for one pair from bid/ask and closed 1H / trend-timeframe rows. Returns (setup, None) or
-    (None, note). Shared with shadow_variants' V_RR2 rebuild, so both use exactly the same stop/target rules."""
+    (None, note)."""
     tf = E["trend_filter"]; k_atr = E["min_stop_atr"]
     nsw = S["swing_lookback_1h"]; buf = S["swing_buffer_atr"]; ntg = S["target_lookback_4h"]
     try:

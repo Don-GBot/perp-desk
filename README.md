@@ -8,7 +8,7 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 
 ## What it is
 
-- **Scripts** do the deterministic work: find setups, size positions, pick leverage, check filters, log shadow decisions.
+- **Scripts** do the deterministic work: find setups, size positions, pick leverage, check filters.
 - **Agents** do the judgment work: run the trade check and manage open positions, rate the news, audit the others.
 - **Shared files** connect them. Agents never message each other.
 
@@ -18,8 +18,6 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 | News analyst | `prompts/news-analyst.md` | every 4h | no |
 | Manager | `prompts/manager.md` | daily + weekly | no |
 | Alerts scanner (optional) | `prompts/scanner.md` | step 0 of the Executor, or :00/:30 | no |
-| Shadow swap logger | none, plain script | every 15 min from cron | never |
-| Shadow filter variants | none, plain script | every 5 min from cron | never |
 
 ## How the pieces fit
 
@@ -27,8 +25,7 @@ A small set of AI agents and Python scripts. Currently supports Blofin USDT perp
 2. `scripts/scanner.py` (optional) writes alerts and info-only flags to `data/flags_latest.json`.
 3. The news analyst rates each pair and writes `data/fundamentals.json`.
 4. The Executor manages open positions with `scripts/manage.py`, filters setups (news gate, 1H trend gate, stock-perp block, universe tier, risk caps), sizes the trade (5% risk is a maximum, scaled down to the binding limit), and opens at most one trade with `scripts/execute.py`. Every per-setup skip is logged to `data/blocked_setups.jsonl` (run-level exits such as a stale scan or max positions only return a gate_reason); `fee_heavy` (fees > 1/3 of the stop-out loss) only applies to trades that were scaled down; `manage.py` writes run records, closed trades and funding paid.
-5. `scripts/shadow_swap.py` logs whether swapping an open trade for a new setup would have paid. `scripts/shadow_variants.py` runs the same setups through alternative filter sets in virtual books. Neither ever trades.
-6. The Manager audits everything against `RULEBOOK.md` and the logs.
+5. The Manager audits everything against `RULEBOOK.md` and the logs.
 
 See `docs/architecture.md` for the diagram.
 
@@ -62,8 +59,7 @@ The prompts are plain markdown. Nothing is tied to one platform.
 1. Create one agent per role and paste the matching `prompts/*.md` as its instructions.
 2. Give it shell access to this repo and the env vars from `.env.example`. Only the Executor needs trading keys; give the others none, or a READ-only key.
 3. Schedule it (see `docs/scheduling.md`): the harness's routine/cron feature, or system cron calling your harness CLI.
-4. Run `shadow_swap.py` from plain cron, not from an agent.
-5. Read `docs/usage-costs.md` before adding wakes or agent-to-agent messages.
+4. Read `docs/usage-costs.md` before adding wakes or agent-to-agent messages.
 
 ## Repo layout
 
@@ -71,9 +67,9 @@ The prompts are plain markdown. Nothing is tied to one platform.
 config.example.yaml   every tunable value, with comments
 RULEBOOK.md           the rules, in plain words
 prompts/              one role prompt per agent
-scripts/              Python scripts (stdlib only): scan, scanner, execute, manage, news_gate, shadow_swap,
-                      shadow_variants, transfers, runlog, blocklog, plus helpers: trend1h, stockperp,
-                      universe, riskcap, slowcrowd, closes, funding, registry, blofin_client, config, lock
+scripts/              Python scripts (stdlib only): scan, scanner, execute, manage, news_gate, transfers,
+                      runlog, blocklog, swapguard, plus helpers: trend1h, stockperp, universe, riskcap,
+                      closes, funding, registry, blofin_client, config, lock
 docs/                 architecture, scheduling, usage costs
 tests/                offline unit tests (no network, no orders)
 CHANGELOG.md          what changed, by date

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-21 (shadow tooling removed)
+
+- Research tooling removed from the public repo: `scripts/shadow_variants.py` (shadow filter books), `scripts/shadow_swap.py` (shadow swap logger), `scripts/slowcrowd.py` (only used by the shadow books), their tests, the `shadow_swap` / `shadow_variants` config sections, and their docs (RULEBOOK §3 / §3b, scheduling, architecture, manager prompt). Older entries below still mention them as history.
+- Trading logic and the tracking behind owner reports are unchanged: closes.py (close log, R, report), blocklog, runlog, funding, transfers, scanner.py, swapguard.
+- RULEBOOK T7: no swaps without the owner's approval (there is no swap tooling in this repo).
+
 ## 2026-10-21 (sync 4, audit fixes)
 
 - Shadow variant stats recompute R from each row's entry/exit/initial_stop with close_row's formula (no double rescale of sync-3 rows); missing fields = `unknown_R`. `R_basis` is set only when R is computed.

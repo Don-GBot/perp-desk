@@ -1,13 +1,12 @@
 """Offline tests for the 1h trend gate, stock-perp block, blocked-setups log (live/dry split), close matching,
-funding logging, run records, transfers detection, slowcrowd helpers and shadow_variants. All mocked, no network.
+funding logging, run records, transfers detection. All mocked, no network.
 Run: python3 -m unittest discover -s tests -v
 """
 import os, sys, json, unittest, datetime as dt
 from unittest import mock
 import test_offline as T          # sets DATA_DIR / BOT_CONFIG to temp + example config before the scripts are imported
 from test_offline import NoNetwork, INS, FakeExchange, fake_candles_up, EX, bf, registry, config
-import trend1h, stockperp as SP, blocklog as BL, closes, funding, runlog, transfers, slowcrowd as SCW
-import shadow_variants as SV
+import trend1h, stockperp as SP, blocklog as BL, closes, funding, runlog, transfers
 
 def fake_candles_down(inst, bar, limit=None):
     return [[100000 - i * 20, 100000 - i * 20 + 60, 100000 - i * 20 - 60, 100000 - i * 20 - 10] for i in range(200)]
@@ -172,52 +171,6 @@ class TestTransfers(NoNetwork):
         self.assertEqual(new, []); self.assertEqual(len(transfers.load_list()), 2)
         self.assertEqual(transfers.main(["add", "--type", "gift", "--amount", "1", "--ts-utc", "2026-01-01T00:00:00Z"]), 2)
 
-class TestSlowCrowd(NoNetwork):
-    def test_z_and_crowd(self):
-        up = [100 * (1.0005 ** i) * (1 + 0.001 * ((-1) ** i)) for i in range(SCW.NEED)]
-        self.assertGreater(SCW.tsmom_z(up), 1)
-        with self.assertRaises(ValueError): SCW.tsmom_z(up[:100])
-        nl, ns = SCW.crowd_sets({"A": 0.003, "B": 0.001, "C": -0.002, "D": 0.0}, 1)
-        self.assertEqual((nl, ns), ({"A"}, {"C"}))
-        self.assertEqual(SCW.funding_paid([dict(fundingRate="0.001", fundingTime="5")], "buy", 1000, 0, 10), 1.0)
-
-class TestShadowVariants(GateBase):
-    def setUp(self):
-        super().setUp()
-        p = mock.patch.object(SV, "candles", fake_candles_up); p.start(); self.patches.append(p)
-        self.mk = SV.Market(); self.mk.ins = lambda i: self.ins.get(i)
-        self.mk.h1 = lambda i: fake_candles_up(i, "1H"); self.mk.ticker = lambda i: dict(askPrice="104000", bidPrice="103990", last="104000")
-        self.now = dt.datetime.now(dt.timezone.utc); self.ts = self.now.isoformat()
-    def book(self): return dict(open=[], closed_n=0)
-    def test_books_differ(self):
-        for v in ("BASELINE", "V_1H", "BASELINE_NO1H", "V_ATR15"):
-            d, why, pl = SV.evaluate(v, SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)
-            self.assertEqual(d, "TAKE", (v, why))
-        d, why, _ = SV.evaluate("STOCKS_ONLY", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)
-        self.assertEqual(why, "not stock_perp")
-        with mock.patch.object(SV, "RR_CAP", 3.0):
-            d, why, _ = SV.evaluate("V_RR10", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)
-        self.assertTrue(why.startswith("rr>="))
-        self.mk.h1 = lambda i: fake_candles_down(i, "1H")
-        self.assertEqual(SV.evaluate("V_1H", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)[1], "1h_trend (down)")
-        self.assertNotIn("1h_trend", SV.evaluate("BASELINE_NO1H", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)[1])
-    def test_crowd_and_slowtrend(self):
-        self.mk.crowd = lambda now_ms: ({"BTC-USDT"}, set())
-        self.assertTrue(SV.evaluate("V_CROWD", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)[1].startswith("crowd: long"))
-        self.mk.z = lambda i: -2.0
-        self.assertTrue(SV.evaluate("V_SLOWTREND", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)[1].startswith("slowtrend: against"))
-        self.mk.z = lambda i: 2.0
-        self.assertEqual(SV.evaluate("V_SLOWTREND", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)[0], "TAKE")
-    def test_exit_tracking(self):
-        d, why, pl = SV.evaluate("BASELINE", SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)
-        pos = SV.open_pos("BASELINE", SETUP, 1, pl, self.ts, self.now)
-        t = pos["cursor"]
-        self.assertEqual(SV.step_bars(pos, [[t, 104000, 113500, 103900, 113000]])[1], "tp")
-        pos = SV.open_pos("BASELINE", SETUP, 1, pl, self.ts, self.now)
-        fill, kind, _ = SV.step_bars(pos, [[t, 104000, 104100, 101000, 101200]])
-        self.assertEqual((fill, kind), (pl["stop"], "stop"))
-    def test_never_posts(self):
-        with self.assertRaises(PermissionError): SV._get_only("POST", "/api/v1/trade/order")
 
 class TestScannerGuards(NoNetwork):
     def _run(self, env):
@@ -414,20 +367,6 @@ class TestBreakevenPriority(NoNetwork):
         self.assertEqual(manage.breakeven_price(p, "0.01", dict(be_stop=99.95)), 99.95)
         self.assertEqual(manage.breakeven_price(p, "0.01", dict(be_stop=None)), 99.88)
 
-class TestShadowManageStep(NoNetwork):
-    def pos(self, **k):
-        d = dict(side="buy", entry=100.0, sl=98.0, coins=10.0, tick="0.01", be=False, best=102.0, trig=101.5, cb=1.0,
-                 trail_on=False, tbest=None, equity_at_entry=1000.0); d.update(k); return d
-    def test_be_only_when_stop_moves(self):
-        p = self.pos(); SV.manage_step(p, 101.0, 1000.0, 1.0, 0)
-        self.assertTrue(p["be"]); self.assertEqual(p["sl"], 100.12)
-        p = self.pos(sl=100.5); SV.manage_step(p, 101.0, 1000.0, 1.0, 0)        # stop already past BE: not moved
-        self.assertFalse(p["be"]); self.assertEqual(p["sl"], 100.5)
-    def test_hard_cut_uses_equity_at_entry(self):
-        p = self.pos(coins=100.0, best=100.0, equity_at_entry=1000.0)   # loss at 99.6 ~ 70 > 55 (5.5% of 1000)
-        self.assertEqual(SV.manage_step(p, 99.6, 100000.0, 1.0, 5)[1], "cut")
-        p = self.pos(coins=100.0, best=100.0, equity_at_entry=100000.0)
-        self.assertIsNone(SV.manage_step(p, 99.6, 1000.0, 1.0, 5))
 
 class TestScannerImport(NoNetwork):
     def test_import_has_no_side_effects(self):

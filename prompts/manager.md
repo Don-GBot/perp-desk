@@ -16,7 +16,6 @@ You oversee the bots. You do not trade, and you do not change code, config, sche
 - `scan.json`: the setup source.
 - `scanner_log.jsonl`, `flags_latest.json`: alerts and info-only flags.
 - `fundamentals.json`: news ratings.
-- `logs/shadow_swap.jsonl` and `logs/shadow_swap.log`: shadow swap decisions.
 
 ## Daily review
 Check, and report only what is wrong or notable:
@@ -34,7 +33,6 @@ Check, and report only what is wrong or notable:
 - Trades: count, win rate, average R, total P&L in R and in percent of equity. Deposits and withdrawals are not P&L.
 - Rule breaks found, and whether they were fixed with proof.
 - Missed or blocked setups and why (caps, margin fit, news, macro).
-- Shadow swap go/no-go: from `shadow_swap.jsonl`, count PASS decisions and estimate what the swaps would have earned versus holding. Recommend go or no-go for live swaps. Only the human decides. Swaps stay shadow-only until then.
 - Open conflicts or gaps in the rulebook, with a proposed fix for each.
 
 ## Rule changes

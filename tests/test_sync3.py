@@ -1,6 +1,6 @@
 """Offline tests for sync 3: universe tiers, fit_size (risk as a maximum, fee_heavy, liq), risk caps (riskcap.py),
-scheduled-dry block logging, unresolved-record block, registry no-overwrite, adoption from order history, log-all-skips
-and the V_RR2 shadow book. All mocked, no network.
+scheduled-dry block logging, unresolved-record block, registry no-overwrite, adoption from order history, log-all-skips.
+All mocked, no network.
 """
 import os, json, unittest, datetime as dt
 from unittest import mock
@@ -9,7 +9,6 @@ from test_offline import NoNetwork, INS, FakeExchange, fake_candles_up, EX, bf, 
 import test_gates_and_logs as G
 from test_gates_and_logs import GateBase, SETUP, rd
 import universe as UN, riskcap as RC, blocklog as BL, runlog, scan as SCN, manage
-import shadow_variants as SV
 
 NOW = dt.datetime.now(dt.timezone.utc)
 def iso(t): return t.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -174,39 +173,13 @@ class TestScheduledDry(NoNetwork):
             EX.log_block(dict(SETUP, _rank=1), 'news_gate', 'x', ctx)
         live = BL.load_live(); self.assertEqual(live[-1]['mode'], 'scheduled_dry'); self.assertEqual(rd(BL.log_path('dry')), [])
 
-class TestRR2(NoNetwork):
-    def test_near_misses_and_bucket(self):
-        sc = dict(rejected=['A-USDT: buy R:R 2.50 <3', 'B-USDT: sell R:R 1.90 <3', 'C-USDT: 4H flat', 'D-USDT: sell R:R 2.00 <3'])
-        self.assertEqual(SV.near_misses(sc), [('A-USDT', 'buy', 2.5), ('D-USDT', 'sell', 2.0)])
-        self.assertEqual(SV.rr_bucket(2.4), '2-3'); self.assertEqual(SV.rr_bucket(3.0), '3+'); self.assertIn('V_RR2', SV.VARIANTS)
+class TestScanGeometry(NoNetwork):
     def test_geometry_matches_scan(self):
         h = fake_candles_up(None, None)
         g, note = SCN.geometry('BTC-USDT', 103990.0, 104000.0, h, h)
         self.assertIsNone(note); self.assertEqual(g['side'], 'buy'); self.assertEqual(g['entry'], 104000.0)
         self.assertLess(g['stop'], g['entry']); self.assertEqual(g['target'], max(x[1] for x in h[-60:]))
 
-class TestShadowRR2AndRisk(GateBase):
-    def setUp(self):
-        super().setUp()
-        p = mock.patch.object(SV, "candles", fake_candles_up); p.start(); self.patches.append(p)
-        self.mk = SV.Market(); self.mk.ins = lambda i: self.ins.get(i)
-        self.mk.h1 = lambda i: fake_candles_up(i, "1H"); self.mk.ticker = lambda i: dict(askPrice="104000", bidPrice="103990", last="104000")
-        self.now = dt.datetime.now(dt.timezone.utc); self.ts = self.now.isoformat()
-    def book(self): return dict(open=[], closed_n=0)
-    def test_rr2_takes_2_to_3(self):
-        s = dict(SETUP, target=110000)   # R:R about 2.4 at the live ask
-        self.assertEqual(SV.evaluate('BASELINE', s, self.book(), self.mk, 1000.0, self.ts, self.now)[0], 'SKIP')
-        d, why, pl = SV.evaluate('V_RR2', s, self.book(), self.mk, 1000.0, self.ts, self.now)
-        self.assertEqual(d, 'TAKE', why); self.assertEqual(pl['rr_bucket'], '2-3')
-        pos = SV.open_pos('V_RR2', s, 1, pl, self.ts, self.now); self.assertEqual((pos['rr_bucket'], pos['universe_tier']), ('2-3', 'core'))
-    def test_book_risk_caps(self):
-        d, why, pl = SV.evaluate('BASELINE', SETUP, self.book(), self.mk, 1000.0, self.ts, self.now)
-        self.assertEqual(pl['risk_caps']['mode'], 'risk')
-        full = dict(open=[dict(inst=f'X{i}-USDT', side='buy', coins=1.0, entry=100.0, sl=95.0, margin=0.0) for i in range(8)], closed_n=0)
-        self.assertTrue(SV.evaluate('BASELINE', SETUP, full, self.mk, 1000.0, self.ts, self.now)[1].startswith('max positions'))
-    def test_ext_tier_filtered(self):
-        d, why, _ = SV.evaluate('BASELINE', dict(SETUP, vol_rank=35), self.book(), self.mk, 1000.0, self.ts, self.now)
-        self.assertTrue(why.startswith('no_fundamentals'), why)
 
 if __name__ == '__main__': unittest.main()
 

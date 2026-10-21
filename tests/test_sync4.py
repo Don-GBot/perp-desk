@@ -1,5 +1,5 @@
 """Offline tests for sync 4: min risk floor, single fundamentals freshness (4.5h), fee-inclusive R / R_price,
-fee-inclusive break-even scratch, shadow cooldown after BE, swapguard. All mocked, no network.
+fee-inclusive break-even scratch, swapguard. All mocked, no network.
 """
 import os, json, tempfile, fcntl, unittest, datetime as dt
 from unittest import mock
@@ -7,7 +7,6 @@ import test_offline as T
 from test_offline import NoNetwork, EX, config
 from test_gates_and_logs import GateBase, SETUP
 import closes, news_gate as NG, universe as UN, swapguard as SG, blocklog as BL
-import shadow_variants as SV
 
 NOW = dt.datetime.now(dt.timezone.utc)
 def iso(t): return t.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -78,28 +77,6 @@ class TestBEScratch(NoNetwork):
         self.assertEqual(closes.scratch_risk(c), (20.0, 'price_fallback')); self.assertTrue(closes.is_scratch(c))
         self.assertEqual(closes.SCRATCH_FALLBACKS[-1]['basis'], 'price_fallback')
 
-class TestShadowCooldownAfterBE(NoNetwork):
-    def test_post_be_not_always_exempt(self):
-        base = dict(kind='be', be_done=True, be_scratch=False)
-        self.assertTrue(SV.cooldown_hit(dict(base, R=-0.7)))                           # BE fired, big loss: cooldown
-        self.assertFalse(SV.cooldown_hit(dict(base, R=-0.2)))                          # scratch
-        self.assertFalse(SV.cooldown_hit(dict(base, R=-0.7, be_scratch=True)))         # exit at the BE stop
-        self.assertTrue(SV.cooldown_hit(dict(kind='stop', be_done=False, R=-1.0)))
-        self.assertFalse(SV.cooldown_hit(dict(kind='tp', be_done=False, R=-1.0)))
-    def test_sync3_row_not_double_rescaled(self):
-        # sync-3 close_row already used planned_risk_per_coin (incl. entry slip) but had no R_basis: R must come out unchanged
-        e, x, st = 100.0, 98.0, 98.0
-        pnl = (x - e) - EX.FEE * (e + x) - EX.SLIP * e; R3 = round(pnl / EX.planned_risk_per_coin(e, st), 4)
-        row = dict(decision='CLOSE', side='buy', kind='stop', entry=e, exit=x, initial_stop=st, R=R3)
-        self.assertEqual(SV.recompute_R(row), R3)
-        short = dict(side='sell', entry=100.0, exit=101.0, initial_stop=102.0, R=123)          # stored R ignored
-        ps = (100 - 101) - EX.FEE * 201 - EX.SLIP * 100
-        self.assertEqual(SV.recompute_R(short), round(ps / EX.planned_risk_per_coin(100, 102), 4))
-    def test_unknown_fields(self):
-        self.assertIsNone(SV.recompute_R(dict(R=-1.0, entry=100.0, initial_stop=98.0, side='buy')))   # no exit
-        self.assertIsNone(SV.recompute_R(dict(R=-1.0, R_basis='allin')))
-    def test_pre_be_stop_never_scratch(self):
-        self.assertTrue(SV.cooldown_hit(dict(kind='stop', be_done=False, be_scratch=False, R=-0.1)))
 
 class TestScratchRequiresBE(NoNetwork):
     def test_no_be_no_scratch(self):

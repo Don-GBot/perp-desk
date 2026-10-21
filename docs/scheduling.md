@@ -7,7 +7,6 @@ All times UTC. Crypto runs 24/7.
 | Alerts scanner (`scanner.py`) | Step 0 of each Executor run. Standalone option: :00 and :30 | No |
 | Executor | Every 30 min at :07 and :37 | Yes |
 | News analyst | Every 4h | Yes |
-| Shadow swap logger (`shadow_swap.py --once`) | Every 15 min at :09, :24, :39, :54 | No |
 | Manager | Daily review, plus a weekly scorecard | Yes |
 
 The Executor runs 7 minutes after the half-hour so the latest 15m candles have closed and the alert pass has data. Agent harnesses often start jobs a few minutes late; the offset absorbs that.
@@ -21,10 +20,6 @@ Cron starts with an almost empty environment. Use the included `run.sh` wrapper:
 Crontab (`crontab -e`). `CRON_TZ` support varies; the times below assume the system runs in UTC:
 
 ```cron
-# Shadow swap logger: plain script, no LLM
-9,24,39,54 * * * *  /path/to/perp-desk/run.sh python3 scripts/shadow_swap.py --once >> data/cron.log 2>&1
-*/5 * * * *         /path/to/perp-desk/run.sh python3 scripts/shadow_variants.py --once >> data/cron.log 2>&1
-
 # Optional standalone alerts scanner (only if the Executor does NOT run it as step 0)
 # 0,30 * * * *  /path/to/perp-desk/run.sh python3 scripts/scanner.py >> data/cron.log 2>&1
 
@@ -36,36 +31,7 @@ Crontab (`crontab -e`). `CRON_TZ` support varies; the times below assume the sys
 
 ## systemd timer
 
-`/etc/systemd/system/shadow-swap.service`:
-
-```ini
-[Unit]
-Description=Shadow swap logger (read-only)
-
-[Service]
-Type=oneshot
-WorkingDirectory=/path/to/perp-desk
-EnvironmentFile=/path/to/perp-desk/.env
-ExecStart=/usr/bin/python3 scripts/shadow_swap.py --once
-```
-
-`/etc/systemd/system/shadow-swap.timer`:
-
-```ini
-[Unit]
-Description=Shadow swap logger every 15 min
-
-[Timer]
-OnCalendar=*-*-* *:09,24,39,54:00 UTC
-Persistent=false
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable with `systemctl enable --now shadow-swap.timer`. Make an Executor service and timer the same way with `OnCalendar=*-*-* *:07,37:00 UTC` and your harness command.
-
-Alternative: `python3 scripts/shadow_swap.py` with no flags runs its own scheduler loop. Use that under a process supervisor if you prefer one long-running process.
+Make a oneshot service per job (e.g. the optional standalone `scanner.py`, or the Executor with your harness command) with `WorkingDirectory=/path/to/perp-desk` and `EnvironmentFile=/path/to/perp-desk/.env`, plus a timer such as `OnCalendar=*-*-* *:07,37:00 UTC`, then `systemctl enable --now <name>.timer`.
 
 ## Swapping files safely
 
@@ -81,6 +47,6 @@ Most harnesses (Grok Bot, Hermes, OpenClaw, Claude Code with a scheduler, and ot
    - Executor: cron `7,37 * * * *`, message "Run the trade check."
    - News analyst: cron `0 */4 * * *`, message "Run the news ratings."
    - Manager: daily cron, message "Run the daily review." Weekly: "Run the weekly scorecard."
-4. Keep the shadow logger out of the harness. It is a plain script; run it from cron or systemd so it costs nothing.
+4. Keep plain scripts (the optional standalone scanner) out of the harness; run them from cron or systemd so they cost nothing.
 
 If your harness bills per wake, look at `docs/usage-costs.md` before shortening any interval.

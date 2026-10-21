@@ -1,4 +1,4 @@
-"""1H trend gate: ONE definition shared by execute.py (live gate), shadow_variants.py and shadow_swap.py.
+"""1H trend gate: ONE definition used by execute.py (live gate).
 
 On the last entry.trend_1h.bars closed candles of entry.trend_1h.bar (default 200 x 1H):
 up = EMA fast > EMA slow and close > EMA slow; down = EMA fast < EMA slow and close < EMA slow; else flat.
