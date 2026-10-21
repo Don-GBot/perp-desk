@@ -137,6 +137,28 @@ entry:
   # Skip any entry (either side) on a pair that still holds an unresolved bot record: a bot_positions.json
   # record with no matching live position, or a pruned record whose close line was not found yet.
   unresolved_record_block: true
+  # Hard filters, every trade (scaled or not), logged as block lines. 0 turns either off.
+  # rr_cap: skip if the planned price R:R is above this (far targets rarely fill).
+  rr_cap_max: 8
+  # cost_heavy: skip if fee_share (round-trip taker fees / stop-out loss, the fee_heavy share) is >= this.
+  cost_heavy_max_share: 0.12
+  # Composite setup ranking (execute.composite_score). Every setup that passes all checks is scored; the highest
+  # score is tried first, then the next (one entry per run). false: scan order (best R:R first).
+  # score = target + gap + cost + btc:
+  #   target: -target_atr_pen per 1H ATR of |target - entry| beyond target_atr_free
+  #   gap:    4H EMA fast-slow gap % (trend_filter EMAs) in the trade direction: + min(gap, gap_full_pct) / gap_full_pct;
+  #           above gap_full_pct -gap_over_pen per % beyond it
+  #   cost:   -fee_share_pen per percentage point of fee_share above fee_share_free
+  #   btc:    +btc_bonus if the BTC-USDT 4H trend agrees with the side
+  composite:
+    enabled: true
+    target_atr_free: 8
+    target_atr_pen: 0.25
+    gap_full_pct: 3
+    gap_over_pen: 0.3333333333333333
+    fee_share_free: 0.08
+    fee_share_pen: 0.25
+    btc_bonus: 0.25
 
 # ---------------------------------------------------------------------------
 # Setup scanner (scripts/scan.py)

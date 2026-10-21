@@ -52,6 +52,8 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Rule | Value |
 |---|---|
 | Minimum R:R | ≥ `min_rr` (3) at the live price (ask for long, bid for short), price-only: (target − entry) / (entry − stop), mirrored for shorts, stop and target rounded to tick. Fees are not deducted from R:R; sizing covers them. |
+| R:R cap | `entry.rr_cap_max` (8): skip `rr_cap` if the planned price R:R is above 8 (far targets rarely fill). 0 turns it off. Block line logged. |
+| Cost-heavy skip | `entry.cost_heavy_max_share` (0.12): skip `cost_heavy` if `fee_share` (round-trip taker fees / stop-out loss, the same share as `fee_heavy`) is ≥ 12%. Applies to every trade, scaled or not. 0 turns it off. Block line logged. |
 | Side geometry | After rounding: stop < entry < target for longs, target < entry < stop for shorts. |
 | Fresh scan | `scan.json` no older than `max_scan_age_min` (35). |
 | Stop vs ATR | Stop distance ≥ `min_stop_atr` (1) × ATR14 on 1H. The order script allows `atr_tolerance` (0.95) for drift. |
@@ -64,15 +66,24 @@ Never trades. Never produces setups. Sends nothing to the Executor.
 | Unresolved record | `entry.unresolved_record_block` (on): no entry, either side, on a pair holding a bot record with no matching live position, or a closed bot record whose close line was not found yet. `bot_positions.json` never overwrites another trade's record. |
 | Re-entry cooldown | After a bot position closes at a loss by its stop-loss, trailing stop or hard cut: no new entry on that pair in the same direction for `cooldown_hours` (4h) from the close. Opposite direction allowed. Wins, break-even scratches (BE must have fired; exit at/beyond the BE stop minus a slippage tolerance, or a loss under 0.5R fee-inclusive), manual positions and manual closes don't trigger it. A read error skips the entry. |
 | No duplicates | No new trade on a pair with any position. |
-| One per run | At most one new open per run. If the best setup fails a check, the next one is tried. |
+| Ranking | `entry.composite` (on): every setup that passes all checks is scored and the top score is tried first (see *Setup ranking*). Off: scan order (best R:R first). |
+| One per run | At most one new open per run. If the best setup fails a check (re-checked at the live price) or its leverage is refused, the next one is tried. |
 | Position mode | Account must be in net (one-way) mode. |
 | News gate | See below. |
 | Macro window | Off by default (`macro_window.enabled: false`) because nothing feeds it yet. When on: no new entries from `hours_before` (2h) before to `hours_after` (1h) after a dated macro event. |
 
+### Setup ranking (`entry.composite`, `execute.composite_score`)
+Score = sum of four terms (higher is better); ties keep scan order, a setup that can't be scored goes last:
+- **Target distance:** −0.25 per 1H ATR of |target − entry| beyond 8 ATR (`target_atr_free`, `target_atr_pen`).
+- **4H EMA gap** (EMA fast − slow of `trend_filter`, 20/50, in % of EMA slow, in the trade direction): + min(gap, 3) / 3; above 3% (stretched) −1/3 per % beyond 3 (`gap_full_pct`, `gap_over_pen`). A gap against the trade scores negative.
+- **Cost:** −0.25 per percentage point of `fee_share` above 8% (`fee_share_free`, `fee_share_pen`); −1.0 at the 12% `cost_heavy` wall.
+- **BTC 4H trend:** +0.25 if BTC-USDT's 4H trend agrees with the side (`btc_bonus`); unreadable = no bonus.
+The 1H trend and the news gate stay hard gates, not score terms. The result carries `candidates` (scored list) and `score`.
+
 ### Setup definition (`scan.py`)
 - Long: entry = ask. Stop = the lower of (lowest low of the last 12 1H candles − 0.25 ATR) and (entry − 1 ATR). Target = highest high of the last 60 4H candles.
 - Short: the mirror.
-- Keep setups with R:R ≥ 3, best R:R first.
+- Keep setups with R:R ≥ 3, best R:R first (`execute.py` then re-ranks by composite score).
 
 ### Sizing, leverage, margin
 | Rule | Value |
@@ -172,5 +183,5 @@ Audits the bots against logs and this rulebook. See `prompts/manager.md`.
 - **Break-even uses the current mark price**, not the best price since entry. A move that reaches the trigger and reverses between runs is missed.
 - **Rating validity (4.5h) is only 30 min longer than the news cadence (4h).** A news run more than 30 min late leaves a gap where ratings are not fresh but the gate has not failed open yet. Entries are allowed in that gap.
 - **Funding is not in R:R or the risk cap** (taker fees and a slippage buffer are). It is logged per position only.
-- **Setup choice:** `execute.py` takes the first (best R:R) setup unless the agent passes `--inst`.
+- **Setup choice:** `execute.py` takes the best composite score (`entry.composite`) among setups that pass every check, unless the agent passes `--inst`. The weights are a heuristic, not a fitted model.
 - **Ownership needs timestamps.** A position the bot opened is recognized by create time (within 120 s of the record or of a bot-prefixed opening order). If the exchange reports a create time far from the order time, the bot treats the position as manual.

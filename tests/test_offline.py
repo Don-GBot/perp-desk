@@ -160,7 +160,7 @@ class TestExecuteValidation(NoNetwork):
         self.assertIsNone(EX.check_scan_fresh(self.fresh))
 
     def test_trend_recheck_rejects_countertrend(self):
-        plan, why = EX.evaluate(dict(instId="BTC-USDT", side="sell", stop=104600, target=100000), self.ctx)
+        plan, why = EX.evaluate(dict(instId="BTC-USDT", side="sell", stop=106000, target=97000), self.ctx)   # wide enough stop to clear cost_heavy (sync 5)
         self.assertIsNone(plan); self.assertIn("trend now up", why)
 
     def test_falls_through_to_next_setup_and_never_posts_on_failure(self):

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-21 (sync 5)
+
+- **Composite setup ranking** (`entry.composite`, on): `execute.py` runs every setup through all checks, scores the passing ones (`composite_score`: −0.25 per 1H ATR of target distance beyond 8; 4H EMA gap + min(gap, 3)/3 and −1/3 per % above 3; −0.25 per point of fee_share above 8%; +0.25 if the BTC 4H trend agrees) and tries the top score first. Later candidates are re-checked at the live price before their order; a failure falls through; still one entry per run. Off = old R:R-first order. The result carries `candidates` and `score`.
+- **`rr_cap`** (`entry.rr_cap_max`, 8): skip setups with planned R:R above 8.
+- **`cost_heavy`** (`entry.cost_heavy_max_share`, 0.12): skip any trade (scaled or not) whose round-trip taker fees are ≥ 12% of the stop-out loss (`fee_share`). `fee_heavy` unchanged.
+- Tests: `tests/test_sync5.py`.
+
 ## 2026-10-21 (shadow tooling removed)
 
 - Research tooling removed from the public repo: `scripts/shadow_variants.py` (shadow filter books), `scripts/shadow_swap.py` (shadow swap logger), `scripts/slowcrowd.py` (only used by the shadow books), their tests, the `shadow_swap` / `shadow_variants` config sections, and their docs (RULEBOOK §3 / §3b, scheduling, architecture, manager prompt). Older entries below still mention them as history.

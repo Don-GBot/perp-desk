@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Executor order script: checks setups from scan.json and opens AT MOST ONE trade. Sends real orders.
 
-  python3 scripts/execute.py                 # try setups in scan.json, best R:R first
+  python3 scripts/execute.py                 # try setups in scan.json, best composite score first
   python3 scripts/execute.py --inst SOL-USDT # only this pair's setup
   python3 scripts/execute.py --dry           # run every check, print the plan, place nothing
 
@@ -10,16 +10,20 @@ Needs BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE. Holds DATA_DIR/exe
 Per run:
   - Reject the whole scan if scan.json is older than entry.max_scan_age_min.
   - Account checks once: equity readable, max positions (risk_caps.max_positions), account in net (one-way) mode.
-  - For each setup in order (best R:R first), skip it with a reason if any check fails, then try the next:
+  - Every setup goes through the checks below (no order); a failing one is skipped with a reason:
     side valid; no position on the pair; not a stock perp (entry.stock_perp_block, stockperp.py; fails closed);
     universe tier: an 'ext' setup (volume rank beyond scan.universe_size) needs a fresh news-analyst rating, else
     no_fundamentals (universe.py; fails closed); re-entry cooldown; caps (risk caps, or the slot caps as fallback);
     no unresolved bot record on the pair (entry.unresolved_record_block); stop/target rounded to tick and
     stop < entry < target (long) or target < entry < stop (short) at the live price;
-    R:R (price-only: (target - entry) / (entry - stop)) >= min_rr; stop >= ATR floor; 4H trend re-checked now;
+    R:R (price-only: (target - entry) / (entry - stop)) >= min_rr; stop >= ATR floor;
+    rr_cap: R:R <= entry.rr_cap_max (8); cost_heavy: fee_share < entry.cost_heavy_max_share (0.12); 4H trend re-checked now;
     1H trend aligned with the side (entry.trend_1h, trend1h.py; flat blocks both sides, a data error skips);
     sizing (fit_size): scaled down to the binding limit, skip fee_heavy / below_min_size / liq / cap_risk.
-  - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop.
+  - Ranking (entry.composite, on): the passing setups are scored by composite_score and tried best score first;
+    each one after the first is re-checked at the live price just before its order. composite off: scan order (R:R).
+  - First setup that passes: set leverage, market order with attached TP/SL, then a trailing stop. A failed re-check or a
+    refused leverage falls through to the next candidate; at most one entry per run.
 Sizing: risk_per_trade_pct is a MAXIMUM. A clean stop-out of a planned entry loses about risk_per_trade_pct of equity
 INCLUDING entry slippage, entry and exit taker fees and an exit slippage buffer: loss per coin = |entry - stop| +
 entry_slip_frac x entry + taker_rate x (entry + stop) + slip_frac x entry. With risk.scale_down the size is then cut
@@ -59,7 +63,7 @@ import universe as UN, riskcap as RC
 def _load_json(path):
     with open(path) as fh:
         return json.load(fh)
-from scan import candles, atr, trend, rr as price_rr, net_rr
+from scan import candles, atr, trend, ema, rr as price_rr, net_rr
 
 C = config.CFG; R_ = C["risk"]; E = C["entry"]; LV = C["leverage"]; M = C["management"]
 RISK = R_["risk_per_trade_pct"] / 100.0
@@ -75,6 +79,8 @@ NEW_MM = LV["margin_mode"]
 LEVMIN = int(LV["min"]); LEVMAX = int(LV["max"]); MARGIN_CAP = LV["margin_cap_pct"] / 100.0
 FREE_BUF = float(LV["free_margin_buffer"]); MMR_DEFAULT = float(LV["mmr_default"]); MAX_STOP_TO_LIQ = float(LV["max_stop_to_liq"])
 TREND1H = T1.ENABLED; STOCKPERP = bool(E["stock_perp_block"]["enabled"])
+RR_CAP = float(E["rr_cap_max"]); COST_HEAVY_MAX = float(E["cost_heavy_max_share"])   # 0 = off
+CP = E["composite"]; COMPOSITE = bool(CP["enabled"])
 SIDES = {'buy': 'buy', 'long': 'buy', 'sell': 'sell', 'short': 'sell'}
 
 def fs(x): return format(Decimal(str(x)).normalize(), 'f')
@@ -118,6 +124,49 @@ def fee_share(entry, stop):
     entry-slip term (|entry - stop| + taker x (entry + stop) + slip_frac x entry). Deliberate: the threshold keeps its
     meaning from before entry slippage was added to sizing."""
     return FEE * (entry + stop) / risk_per_coin(entry, stop)
+
+def filter_gate(entry, stop, rr):
+    """(gate_reason, why) for the rr_cap / cost_heavy hard filters, else (None, None).
+    rr_cap: planned price R:R above entry.rr_cap_max. cost_heavy: fee_share (round-trip taker fees / stop-out loss, the
+    same share as fee_heavy) >= entry.cost_heavy_max_share. Applies to every trade, scaled or not."""
+    if RR_CAP > 0 and rr > RR_CAP: return 'rr_cap', f'rr_cap: planned R:R {rr:.2f} > {RR_CAP:g}'
+    if COST_HEAVY_MAX > 0:
+        c = fee_share(entry, stop)
+        if c >= COST_HEAVY_MAX: return 'cost_heavy', f'cost_heavy: round-trip fees {c*100:.1f}% of stop-out loss >= {COST_HEAVY_MAX*100:g}%'
+    return None, None
+
+def composite_score(side, entry, stop, target, atr1h, ema_fast4h, ema_slow4h, btc_trend4h):
+    """Composite rank score (higher = better) and its components. Pure; weights in entry.composite.
+      target: -target_atr_pen per 1H ATR of |target - entry| beyond target_atr_free
+      gap:    4H EMA fast-slow gap % in the trade direction: + min(gap, gap_full_pct) / gap_full_pct, and above
+              gap_full_pct -gap_over_pen per % beyond it (a gap against the trade scores negative)
+      cost:   -fee_share_pen per percentage point of fee_share above fee_share_free
+      btc:    +btc_bonus if the BTC 4H trend agrees with the side"""
+    long_ = side in ('buy', 'long')
+    tgt_atr = abs(target - entry) / atr1h if atr1h else None
+    s_tgt = -CP["target_atr_pen"] * max(0.0, tgt_atr - CP["target_atr_free"]) if tgt_atr is not None else 0.0
+    gap = (ema_fast4h - ema_slow4h) / ema_slow4h * 100 * (1 if long_ else -1) if ema_fast4h and ema_slow4h else None
+    full = float(CP["gap_full_pct"])
+    if gap is None: s_gap = 0.0
+    elif gap <= full: s_gap = gap / full
+    else: s_gap = 1.0 - CP["gap_over_pen"] * (gap - full)
+    fsh = fee_share(entry, stop)
+    s_cost = -CP["fee_share_pen"] * max(0.0, (fsh - CP["fee_share_free"]) * 100)
+    al = (btc_trend4h == 'up' and long_) or (btc_trend4h == 'down' and not long_)
+    s_btc = float(CP["btc_bonus"]) if al else 0.0
+    sc = s_tgt + s_gap + s_cost + s_btc
+    return dict(score=round(sc, 4), target_atr=None if tgt_atr is None else round(tgt_atr, 3), gap4h_pct=None if gap is None else round(gap, 3),
+                fee_share=round(fsh, 4), btc_trend4h=btc_trend4h, btc_aligned=bool(al),
+                s_target=round(s_tgt, 4), s_gap=round(s_gap, 4), s_cost=round(s_cost, 4), s_btc=round(s_btc, 4))
+
+def ema4h(inst, closes4h=None):
+    """(ema_fast, ema_slow) of 4H closes, lengths from entry.trend_filter."""
+    tf = E['trend_filter']; c = closes4h if closes4h is not None else [x[3] for x in candles(inst, '4H')]
+    return ema(c, tf['ema_fast'])[-1], ema(c, tf['ema_slow'])[-1]
+
+def btc_trend4h():
+    try: return trend([x[3] for x in candles('BTC-USDT', '4H')])[0]
+    except Exception: return None
 
 def lev_liq_max(entry, stop, mmr=MMR_DEFAULT, maxlev=LEVMAX):
     """Highest L in [min, min(max, maxlev)] whose estimated liq distance entry x (1/L - mmr) is beyond the stop distance
@@ -250,7 +299,7 @@ def log_block(setup, gate_reason, reason, ctx, extra=None):
         BL.append(line)
     except Exception as e: ctx.setdefault('warnings', []).append(f'blocked_setups log failed: {str(e)[:160]}')
 
-GATES = (('unresolved', 'unresolved_record'), ('cooldown', 'cooldown'), ('max positions', 'max_positions'),
+GATES = (('rr_cap', 'rr_cap'), ('cost_heavy', 'cost_heavy'), ('unresolved', 'unresolved_record'), ('cooldown', 'cooldown'), ('max positions', 'max_positions'),
          ('overall cap', 'overall_cap'), ('direction cap', 'dir_cap'), ('already has a position', 'duplicate'),
          ('existing position', 'duplicate'), ('r:r', 'rr'), ('atr', 'atr'), ('trend now', 'trend'), ('news gate', 'news_gate'),
          ('macro', 'macro_window'), ('instrument', 'instrument'), ('needs stop', 'geometry'), ('needs target', 'geometry'),
@@ -365,9 +414,13 @@ def evaluate(setup, ctx):
     if rr < MINRR: return None, f'R:R {rr:.2f} < {MINRR:g}'
     a1 = atr(candles(inst, '1H'))
     if risk < ATR_FLOOR * a1: return None, f'stop {risk/a1:.2f}x ATR < {E["min_stop_atr"]:g}'
-    tf = E['trend_filter']
+    fg, fw = filter_gate(entry, stop, rr)
+    if fg:
+        log_block(setup, fg, fw, ctx); return None, fw
+    tf = E['trend_filter']; c4 = None
     if tf['enabled']:
-        tr = trend([x[3] for x in candles(inst, tf['timeframe'])])[0]
+        c4 = [x[3] for x in candles(inst, tf['timeframe'])]
+        tr = trend(c4)[0]
         want = 'up' if side == 'buy' else 'down'
         if tr != want: return None, f'{tf["timeframe"]} trend now {tr}, need {want}'
     tw, t1d = trend1h_check(inst, side)
@@ -389,12 +442,16 @@ def evaluate(setup, ctx):
         log_block(setup, 'liq', why, ctx); return None, why
     live = pair_positions(inst)
     if live: return None, 'existing position on pair; leverage untouched'
+    ema4 = None
+    if COMPOSITE:
+        try: ema4 = ema4h(inst, c4 if tf['enabled'] and tf['timeframe'] == '4H' else None)
+        except Exception as e: ctx['warnings'].append(f'{inst} 4H EMA for score unreadable: {str(e)[:120]}')
     coid = bf.client_order_id(PREFIX)
     plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr=rr, rr_net=net_rr(side, entry, stop, target),
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
                 stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, entry_slip_frac=ENTRY_SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
                 ctVal=cv, risk_usdt=size * cv * risk, size_full=sz['size_full'], scaled_down=sz['scaled_down'], scaled_by=sz['scaled_by'], risk_pct_actual=sz['risk_pct_actual'],
-                fee_share=sz['fee_share'], universe_tier=UN.tier_of(setup), vol_rank=setup.get('vol_rank'),
+                fee_share=sz['fee_share'], ema4h=ema4, universe_tier=UN.tier_of(setup), vol_rank=setup.get('vol_rank'),
                 risk_caps={k: rca.get(k) for k in ('mode', 'total_pct', 'dir_pct', 'headroom', 'n_pos', 'error')},
                 lev_req=dict(instId=inst, leverage=str(lev), marginMode=NEW_MM, positionSide='net'),
                 order_req=dict(instId=inst, marginMode=NEW_MM, positionSide='net', side=side, orderType='market',
@@ -526,6 +583,7 @@ def run(setups, scan_ts, now=None, dry=False):
     if mode != 'net_mode': return dict(ok=False, why=f'account position mode {mode} != net_mode', gate_reason='position_mode')
     ctx = dict(equity=equity, avail=avail, pos=pos, ins=instruments(), dry=dry, scan_ts=scan_ts, warnings=[])
     skipped = []
+    if COMPOSITE: return _run_composite(setups, ctx, skipped, dry)
     for i, s in enumerate(setups):
         s = dict(s, _rank=i + 1)
         try: plan, why = evaluate(s, ctx)
@@ -540,6 +598,47 @@ def run(setups, scan_ts, now=None, dry=False):
         if LOG_ALL_SKIPS: log_block(s, 'leverage', out.get('why'), ctx)
         skipped.append(dict(instId=s.get('instId'), why=out.get('why'))); continue  # leverage refused: try next
     return dict(ok=False, why='no setup passed the checks', skipped=skipped, warnings=ctx['warnings'], **(dict(dry=True) if dry else {}))
+
+def _skip(s, why, ctx, skipped):
+    if LOG_ALL_SKIPS: log_block(s, gate_of(why), why, ctx)   # no-op if a gate already logged this setup
+    skipped.append(dict(instId=s.get('instId'), why=why))
+
+def score_plan(plan, btc):
+    try:
+        e1, e2 = plan.get('ema4h') or (None, None)
+        return composite_score(plan['side'], plan['entry'], plan['stop'], plan['target'], plan['atr1h'], e1, e2, btc)
+    except Exception as e: return dict(score=None, error=f'{type(e).__name__}: {str(e)[:120]}')
+
+def _run_composite(setups, ctx, skipped, dry):
+    """Composite ranking (entry.composite): every setup goes through evaluate() (all checks, no order); the passing
+    plans are scored (composite_score) and tried best score first (unscorable last, ties in scan order). dry: the
+    best plan is returned. live: the candidate is re-evaluated at the live price right before placing; a failed
+    re-check or a refused leverage falls through to the next candidate. At most one entry per run."""
+    btc = btc_trend4h(); cands = []
+    for i, s in enumerate(setups):
+        s = dict(s, _rank=i + 1)
+        try: plan, why = evaluate(s, ctx)
+        except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
+        if plan is None: _skip(s, why, ctx, skipped); continue
+        cands.append(dict(i=i, s=s, plan=plan, sc=score_plan(plan, btc)))
+    order = sorted(cands, key=lambda c: (c['sc'].get('score') is None, -(c['sc'].get('score') or 0), c['i']))
+    ranked = [dict(rank=c['i'] + 1, instId=c['plan']['instId'], side=c['plan']['side'], rr=round(c['plan']['rr'], 3), **c['sc']) for c in order]
+    base = dict(skipped=skipped, warnings=ctx['warnings'], candidates=ranked, btc_trend4h=btc)
+    if dry:
+        if order: return dict(ok=True, dry=True, plan=order[0]['plan'], score=order[0]['sc'], **base)
+        return dict(ok=False, dry=True, why='no setup passed the checks', **base)
+    for n, c in enumerate(order):
+        s = c['s']; plan = c['plan']
+        if n:   # the first plan is fresh; later ones are re-checked at the live price
+            try: plan, why = evaluate(s, ctx)
+            except Exception as e: plan, why = None, f'error: {str(e)[:200]}'
+            if plan is None: _skip(s, why, ctx, skipped); continue
+        out = place(plan); out.update(skipped=skipped, score=c['sc'], candidates=ranked)
+        if ctx['warnings']: out.setdefault('warnings', []).extend(ctx['warnings'])
+        if out.get('ok') or out.get('order_resp') is not None: return out   # accepted, rejected or unknown: stop here
+        if LOG_ALL_SKIPS: log_block(s, 'leverage', out.get('why'), ctx)
+        skipped.append(dict(instId=s.get('instId'), why=out.get('why')))
+    return dict(ok=False, why='no setup passed the checks', **base)
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
