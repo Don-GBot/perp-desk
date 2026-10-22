@@ -1,10 +1,11 @@
 """Registry of positions the bot opened: DATA_DIR/bot_positions.json, keyed by instId.
 
-A record only counts for a position if it MATCHES that position: same instId and side, and either
-the stored position createTime equals the position's createTime, or the position was created within
-MATCH_WINDOW_MS of the record's opened_at. The createTime comparison is a tolerance (within MATCH_WINDOW_MS), not
-string equality: the exchange can report a createTime a millisecond off the one seen right after the fill. Pair + side alone is never enough, so a stale record can't
-make a later manual trade on the same pair look like the bot's. prune() drops records that match no
+A record only counts for a position if it MATCHES that position: same instId and side, then the
+positionId when both the record and the position carry one (equal = match, different = no match). Only if
+either side lacks a positionId: the stored position createTime within CT_TOL_MS (1 s) of the position's
+createTime (the exchange can move a createTime by a few ms on the same position), else the position was
+created within MATCH_WINDOW_MS (120 s) of the record's opened_at. Pair + side alone is never enough, so a
+stale record can't make a later manual trade on the same pair look like the bot's. prune() drops records that match no
 open position; execute.py and manage.py call it at the start of every run.
 """
 import os, json, datetime as dt
@@ -12,6 +13,7 @@ import config
 
 FILE = "bot_positions.json"
 MATCH_WINDOW_MS = 120_000
+CT_TOL_MS = 1000          # position_createTime tolerance, used only when either side lacks a positionId
 
 def load():
     try:
@@ -36,13 +38,15 @@ def iso_ms(x):
 def matches(p, rec, window_ms=MATCH_WINDOW_MS):
     if not rec or rec.get("instId") != p.get("instId"): return False
     if (rec.get("side") == "buy") != (float(p.get("positions") or 0) > 0): return False
+    rpid, ppid = str(rec.get("positionId") or ""), str(p.get("positionId") or "")
+    if rpid and ppid: return rpid == ppid          # both have a positionId: it decides (createTime is not consulted)
     try: ct = int(p.get("createTime") or 0)
     except Exception: ct = 0
     if not ct: return False
     pct = rec.get("position_createTime")
     try: pct = int(float(pct)) if pct else None
     except (TypeError, ValueError): pct = None
-    if pct and abs(ct - pct) <= window_ms: return True
+    if pct: return abs(ct - pct) <= CT_TOL_MS
     oa = iso_ms(rec.get("opened_at"))
     return bool(oa and abs(ct - oa) <= window_ms)
 

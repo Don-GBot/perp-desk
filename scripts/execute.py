@@ -11,7 +11,8 @@ Per run:
   - Reject the whole scan if scan.json is older than entry.max_scan_age_min.
   - Account checks once: equity readable, max positions (risk_caps.max_positions), account in net (one-way) mode.
   - Every setup goes through the checks below (no order); a failing one is skipped with a reason:
-    side valid; no position on the pair; not a stock perp (entry.stock_perp_block, stockperp.py; fails closed);
+    side valid; BTC 4h veto (entry.btc_4h_veto: BTC-USDT 4h return from 5m closes, fetched once per run; long skipped
+    if < -max_move, short if > +max_move; stale or missing BTC data skips both sides, fail closed); no position on the pair; not a stock perp (entry.stock_perp_block, stockperp.py; fails closed);
     universe tier: an 'ext' setup (volume rank beyond scan.universe_size) needs a fresh news-analyst rating, else
     no_fundamentals (universe.py; fails closed); re-entry cooldown; caps (risk caps, or the slot caps as fallback);
     no unresolved bot record on the pair (entry.unresolved_record_block); stop/target rounded to tick and
@@ -81,6 +82,8 @@ FREE_BUF = float(LV["free_margin_buffer"]); MMR_DEFAULT = float(LV["mmr_default"
 TREND1H = T1.ENABLED; STOCKPERP = bool(E["stock_perp_block"]["enabled"])
 RR_CAP = float(E["rr_cap_max"]); COST_HEAVY_MAX = float(E["cost_heavy_max_share"])   # 0 = off
 CP = E["composite"]; COMPOSITE = bool(CP["enabled"])
+BV = E["btc_4h_veto"]; BTC4H = bool(BV["enabled"]); BTC4H_MAX = float(BV["max_move"]); BTC4H_STALE_MIN = float(BV["stale_min"])
+BTC4H_INST = 'BTC-USDT'; BTC4H_BAR = '5m'; BTC4H_LIMIT = 60
 SIDES = {'buy': 'buy', 'long': 'buy', 'sell': 'sell', 'short': 'sell'}
 
 def fs(x): return format(Decimal(str(x)).normalize(), 'f')
@@ -287,6 +290,41 @@ def stockperp_check(inst, ins=None):
     except Exception as e: return 'stock_perp (data error)', str(e)[:160]
     return (f'stock_perp ({how})', how) if stock else (None, how)
 
+def btc4h_fetch(now=None):
+    """BTC-USDT 4h return from public 5m candles: dict(state='ok'|'stale'|'missing', ret, last_close, ref_close,
+    last_ts_utc, age_min, error). ret = last close / the close exactly 4h before it - 1. Never raises."""
+    try:
+        r = bf.public('/api/v1/market/candles', {'instId': BTC4H_INST, 'bar': BTC4H_BAR, 'limit': BTC4H_LIMIT})
+        rows = r.get('data') if isinstance(r, dict) else None
+        if not rows: return dict(state='missing', ret=None, error=f'no {BTC4H_INST} {BTC4H_BAR} candles ({str(r)[:120]})')
+        cs = {int(x[0]): float(x[4]) for x in rows}
+        last = max(cs); nowt = (now or now_utc()).timestamp()
+        age = (nowt - last / 1000.0) / 60.0
+        lts = dt.datetime.fromtimestamp(last / 1000.0, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        if age > BTC4H_STALE_MIN:
+            return dict(state='stale', ret=None, last_ts_utc=lts, age_min=round(age, 1),
+                        error=f'last {BTC4H_INST} candle {lts} is {age:.1f}min old > {BTC4H_STALE_MIN:g}min')
+        ref = cs.get(last - 4 * 3600 * 1000); lc = cs[last]
+        if ref is None or not (ref > 0 and lc > 0):
+            return dict(state='missing', ret=None, last_ts_utc=lts, age_min=round(age, 1), error=f'no {BTC4H_INST} close 4h before {lts}')
+        return dict(state='ok', ret=round(lc / ref - 1.0, 12), last_close=lc, ref_close=ref, last_ts_utc=lts, age_min=round(age, 1), error=None)
+    except Exception as e: return dict(state='missing', ret=None, error=f'{BTC4H_INST} candles error: {e!r}'[:200])
+
+def btc4h_check(side, ctx=None):
+    """(reason, detail, data); reason None = pass. One fetch per run when ctx is given (ctx['_btc4h'], also used by the
+    pre-order re-check). Missing or stale data blocks both sides (fail closed). No-op when entry.btc_4h_veto is off."""
+    if not BTC4H: return None, None, None
+    if ctx is not None and ctx.get('_btc4h') is not None: b = ctx['_btc4h']
+    else:
+        b = btc4h_fetch()
+        if ctx is not None: ctx['_btc4h'] = b
+    if b.get('state') != 'ok': return f"btc_4h_veto ({b.get('state')} BTC data, fail closed): {b.get('error')}", b.get('state'), b
+    ret = b['ret']; th = BTC4H_MAX
+    d = f"BTC 4h {ret*100:+.2f}% (close {b['last_close']:g} vs {b['ref_close']:g} 4h earlier)"
+    if side == 'buy' and ret < -th: return f'btc_4h_veto: {d} < -{th*100:g}%, long blocked', d, b
+    if side == 'sell' and ret > th: return f'btc_4h_veto: {d} > +{th*100:g}%, short blocked', d, b
+    return None, d, b
+
 def trend1h_check(inst, side, rows=None):
     """(reason, detail) if the 1H trend does not agree with side or cannot be read (fail closed), else (None, detail)."""
     if not TREND1H: return None, None
@@ -312,7 +350,7 @@ def log_block(setup, gate_reason, reason, ctx, extra=None):
         BL.append(line)
     except Exception as e: ctx.setdefault('warnings', []).append(f'blocked_setups log failed: {str(e)[:160]}')
 
-GATES = (('rr_cap', 'rr_cap'), ('cost_heavy', 'cost_heavy'), ('unresolved', 'unresolved_record'), ('cooldown', 'cooldown'), ('max positions', 'max_positions'),
+GATES = (('btc_4h_veto', 'btc_4h_veto'), ('rr_cap', 'rr_cap'), ('cost_heavy', 'cost_heavy'), ('unresolved', 'unresolved_record'), ('cooldown', 'cooldown'), ('max positions', 'max_positions'),
          ('overall cap', 'overall_cap'), ('direction cap', 'dir_cap'), ('already has a position', 'duplicate'),
          ('existing position', 'duplicate'), ('r:r', 'rr'), ('atr', 'atr'), ('trend now', 'trend'), ('news gate', 'news_gate'),
          ('macro', 'macro_window'), ('instrument', 'instrument'), ('needs stop', 'geometry'), ('needs target', 'geometry'),
@@ -393,6 +431,9 @@ def evaluate(setup, ctx):
     if not inst or not side: return None, f'bad setup: instId {inst!r} side {setup.get("side")!r}'
     try: stop_raw = float(setup['stop']); target_raw = float(setup['target'])
     except Exception: return None, 'bad setup: stop/target missing or not numeric'
+    bw, bd, bb = btc4h_check(side, ctx)   # btc_4h_veto: first gate, before any other read
+    if bw:
+        log_block(setup, 'btc_4h_veto', bw, ctx, dict(detail=bd)); return None, bw
     pos = ctx['pos']
     if any(p['instId'] == inst for p in pos): return None, 'pair already has a position'
     ins = ctx['ins'].get(inst)
@@ -467,7 +508,7 @@ def evaluate(setup, ctx):
         try: ema4 = ema4h(inst, c4 if tf['enabled'] and tf['timeframe'] == '4H' else None)
         except Exception as e: ctx['warnings'].append(f'{inst} 4H EMA for score unreadable: {str(e)[:120]}')
     coid = bf.client_order_id(PREFIX)
-    plan = dict(instId=inst, side=side, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr=rr, rr_net=net_rr(side, entry, stop, target),
+    plan = dict(instId=inst, side=side, btc4h=bb, news=ng, trend1h=t1d, asset_class=SP.asset_class(inst, ins), macro=mc, equity=equity, avail=avail, entry=entry, stop=stop, target=target, rr=rr, rr_net=net_rr(side, entry, stop, target),
                 atr1h=a1, size=size, notional=notional, lev=lev, margin=notional / lev, margin_cap=cap, liq_est=liq,
                 stop_dist=risk, fee_rate=FEE, slip_frac=SLIP, entry_slip_frac=ENTRY_SLIP, est_loss_at_stop=size * loss_per_contract(entry, stop, cv), tick=tick,
                 ctVal=cv, risk_usdt=size * cv * risk, size_full=sz['size_full'], scaled_down=sz['scaled_down'], scaled_by=sz['scaled_by'], risk_pct_actual=sz['risk_pct_actual'],

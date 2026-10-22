@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import config, news_gate, registry, execute as EX, blofin_client as bf
 import manage
+EX.BTC4H = False   # pre-btc_4h_veto fixtures have no BTC 5m candles; the veto is covered by tests/test_sync10.py
 
 def now_ms(): return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 def iso_ago(sec=0): return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=sec)).isoformat()

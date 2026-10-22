@@ -30,6 +30,7 @@ DEFAULTS = {
               "trend_1h": {"enabled": True, "bar": "1H", "bars": 200, "ema_fast": 20, "ema_slow": 50},
               "stock_perp_block": {"enabled": True}, "unresolved_record_block": True,
               "rr_cap_max": 8, "cost_heavy_max_share": 0.12,
+              "btc_4h_veto": {"enabled": True, "max_move": 0.01, "stale_min": 15},
               "composite": {"enabled": True, "target_atr_free": 8, "target_atr_pen": 0.25, "gap_full_pct": 3,
                             "gap_over_pen": 0.3333333333333333, "fee_share_free": 0.08, "fee_share_pen": 0.25, "btc_bonus": 0.25}},
     "scan": {"universe_size": 25, "universe_ext_enabled": True, "universe_ext_size": 40, "max_spread_pct": 0.1, "swing_lookback_1h": 12, "swing_buffer_atr": 0.25,
@@ -166,6 +167,9 @@ def validate(cfg):
     _num(cfg, "entry.atr_tolerance", 0, 1, lo_incl=False); _num(cfg, "entry.max_scan_age_min", 0, lo_incl=False)
     _bool(cfg, "entry.trend_1h.enabled"); _bool(cfg, "entry.stock_perp_block.enabled"); _bool(cfg, "entry.unresolved_record_block")
     _num(cfg, "entry.rr_cap_max", 0); _num(cfg, "entry.cost_heavy_max_share", 0, 1)
+    if not isinstance(cfg["entry"].get("btc_4h_veto"), dict): raise ConfigError("entry.btc_4h_veto must be a mapping")
+    _bool(cfg, "entry.btc_4h_veto.enabled"); _num(cfg, "entry.btc_4h_veto.max_move", 0, 1, lo_incl=False)
+    _num(cfg, "entry.btc_4h_veto.stale_min", 0, 240, lo_incl=False)
     if not isinstance(cfg["entry"].get("composite"), dict): raise ConfigError("entry.composite must be a mapping")
     _bool(cfg, "entry.composite.enabled")
     for k in ("target_atr_free", "target_atr_pen", "gap_over_pen", "fee_share_pen", "btc_bonus"): _num(cfg, "entry.composite." + k, 0)

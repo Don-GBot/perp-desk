@@ -20,8 +20,9 @@ in the positions history and logged to DATA_DIR/closed_trades.jsonl (closes.py: 
   - runlog.py appends one run record per invocation to DATA_DIR/runs.json (logging.run_records); its run_id is in the output.
 
 Bot vs manual positions: a position is the bot's if
-  (a) a bot_positions.json record MATCHES it (same pair and side, and the position's createTime equals
-      the recorded one or is within 120 s of the recorded opened_at; pair + side alone never counts), or
+  (a) a bot_positions.json record MATCHES it (registry.matches: same pair and side, then the positionId when
+      both carry one; only without a positionId on either side: createTime within 1 s of the recorded
+      position_createTime, else within 120 s of the recorded opened_at; pair + side alone never counts), or
   (b) the exchange order history has a FILLED, non-reduce-only opening order on that side whose
       clientOrderId starts with bot.client_order_prefix, created within 120 s of the position.
 Only values from a matching record (initial_stop, target, stop_dist, equity_at_entry) are ever used.

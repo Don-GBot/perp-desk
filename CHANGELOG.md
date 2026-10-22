@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-22 (sync 10)
+
+- **BTC 4h veto** (`entry.btc_4h_veto`, on; `max_move` 0.01, `stale_min` 15): new hard entry gate `btc_4h_veto` in `execute.evaluate()`, the first check per setup (composite first pass, pre-order re-check, scan-order walk). BTC-USDT 4h return = last 5m close / the 5m close exactly 4h earlier − 1 (`execute.btc4h_fetch`, 60 public 5m candles, one fetch per run, reused by the re-check). Long skipped if < −1%, short if > +1% (strict), every pair. Missing data, a fetch error, no close exactly 4h back, or a last candle older than 15 min skips both sides (fail closed). A skip falls through to the next setup and writes a block line; the plan carries `btc4h`. Open positions untouched.
+- **Ownership by positionId** (`registry.matches`, used by manage.py ownership, the direction cap, risk caps and prune): when both the record and the position carry a positionId it decides (equal = match, different = no match). Only without one on either side: recorded position createTime within 1 s (`CT_TOL_MS`; was 120 s), else `opened_at` within 120 s. A different positionId now never matches, even with a nearby createTime.
+- Tests: `tests/test_sync10.py`; older fixtures pin the veto off (`EX.BTC4H = False` in test_offline.py, no BTC 5m candles in their fakes).
+
 ## 2026-10-21 (sync 9)
 
 - **Exit slippage buffer raised** (`fees.slip_frac` 0.0018 → 0.0025, i.e. 0.25% of entry), as live. Applies to sizing, the hard cut, risk-cap open risk and the break-even scratch tolerance in `closes.is_scratch` (exit at/beyond `be_stop` minus 0.25%). `fees.entry_slip_frac` stays 0.0018.

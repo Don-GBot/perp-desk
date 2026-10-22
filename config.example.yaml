@@ -142,6 +142,15 @@ entry:
   rr_cap_max: 8
   # cost_heavy: skip if fee_share (round-trip taker fees / stop-out loss, the fee_heavy share) is >= this.
   cost_heavy_max_share: 0.12
+  # BTC 4h veto (hard entry gate 'btc_4h_veto', every pair, first check per setup). BTC-USDT 4h return = last 5m close /
+  # the 5m close exactly 4h earlier - 1 (one fetch of 60 public 5m candles per run). A new LONG is skipped if the return
+  # is < -max_move, a new SHORT if it is > +max_move (strict: exactly +/-max_move passes). No candles, a fetch error, no
+  # close exactly 4h before the last one, or a last candle older than stale_min minutes skips BOTH sides (fail closed).
+  # Open positions are not touched.
+  btc_4h_veto:
+    enabled: true
+    max_move: 0.01
+    stale_min: 15
   # Composite setup ranking (execute.composite_score). Every setup that passes all checks is scored; the highest
   # score is tried first, then the next (one entry per run). false: scan order (best R:R first).
   # score = target + gap + cost + btc:
