@@ -224,7 +224,7 @@ class TestCooldown(GateBase):
         d.update(k); return d
     def test_values(self):
         self.assertEqual(config.CFG["risk"]["cooldown_hours"], 4); self.assertEqual(EX.MAXDIR, 3)
-        self.assertEqual(EX.SLIP, 0.0018); self.assertEqual(config.CFG["management"]["breakeven_fee_legs"], 2)
+        self.assertEqual(EX.SLIP, 0.0025); self.assertEqual(config.CFG["management"]["breakeven_fee_legs"], 2)
     def test_losing_stop_blocks_same_side_4h(self):
         write_closed([self.L()])
         plan, why = EX.evaluate(SETUP, self.ctx)
@@ -234,7 +234,7 @@ class TestCooldown(GateBase):
         self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"])                  # after 4h
     def test_kinds_that_do_not_trigger(self):
         for l in (self.L(realized_pnl=5, kind="tp"), self.L(kind="manual"), self.L(close_avg=100.2, be_stop=100.1),
-                  self.L(be_done=True, close_avg=100.0, be_stop=100.1),         # BE fired, within the 0.18% slippage tolerance
+                  self.L(be_done=True, close_avg=100.0, be_stop=100.1),         # BE fired, within the 0.25% slippage tolerance
                   self.L(be_done=True, realized_pnl=-20, equity_at_entry=1000), self.L(realized_pnl=0)):   # BE fired, 20 < 0.5R (R = 50)
             write_closed([l]); self.assertFalse(closes.cooldown_check("BTC-USDT", "buy", self.now)["block"], l)
         for l in (self.L(be_done=True), self.L(be_done=True, close_avg=99.5, be_stop=100.1),   # BE marked, filled far below
@@ -273,8 +273,8 @@ class TestDirCap(GateBase):
 
 class TestSlippageAndBE(NoNetwork):
     def test_sizing_includes_slippage(self):
-        self.assertAlmostEqual(EX.risk_per_coin(100, 98), 2 + 0.0006 * 198 + 0.0018 * 100)
-        self.assertAlmostEqual(EX.planned_risk_per_coin(100, 98), 2 + 0.0018 * 100 + 0.0006 * 198 + 0.0018 * 100)   # + entry slip
+        self.assertAlmostEqual(EX.risk_per_coin(100, 98), 2 + 0.0006 * 198 + 0.0025 * 100)
+        self.assertAlmostEqual(EX.planned_risk_per_coin(100, 98), 2 + 0.0018 * 100 + 0.0006 * 198 + 0.0025 * 100)   # + entry slip
         self.assertEqual(EX.size_for(1000, 100, 98, 1, "0.01"), float(int(50 / EX.planned_risk_per_coin(100, 98) * 100) / 100))
     def test_hard_cut_distance_solves_all_in(self):
         import manage

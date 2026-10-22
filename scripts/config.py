@@ -22,7 +22,7 @@ DEFAULTS = {
              "one_new_open_per_run": True, "cooldown_hours": 4,
              "scale_down": True, "fee_heavy_max_share": 0.3333333333333333, "min_risk_pct": 1.0,
              "risk_caps": {"enabled": True, "total_pct": 20, "direction_pct": 15, "max_positions": 8, "manual_no_stop_pct": 5}},
-    "fees": {"taker_rate": 0.0006, "slip_frac": 0.0018, "entry_slip_frac": 0.0018},
+    "fees": {"taker_rate": 0.0006, "slip_frac": 0.0025, "entry_slip_frac": 0.0018},
     "bot": {"client_order_prefix": "bfx", "protect_manual_trades": True, "adopt_from_history": True},
     "entry": {"min_rr": 3, "min_stop_atr": 1, "atr_tolerance": 0.95,
               "trend_filter": {"enabled": True, "timeframe": "4H", "ema_fast": 20, "ema_slow": 50},

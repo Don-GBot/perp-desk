@@ -103,8 +103,8 @@ class TestMinRiskUnrounded(GateBase):
         self.assertFalse(sz['scaled_down']); self.assertEqual(sz['gate'], 'below_min_risk')
     def test_margin_scaled_trade(self):
         sz = EX.fit_size(1000, 30, 100.0, 97.0, 1.0, '0.01', 0.01)   # tiny free margin forces a margin scale-down
-        self.assertEqual(sz['scaled_by'], ['margin']); self.assertIsNone(sz['gate']); self.assertAlmostEqual(sz['risk_pct_actual'], 1.485)
-        with mock.patch.object(EX, 'MIN_RISK_PCT', 1.5):
+        self.assertEqual(sz['scaled_by'], ['margin']); self.assertIsNone(sz['gate']); self.assertAlmostEqual(sz['risk_pct_actual'], 1.515)
+        with mock.patch.object(EX, 'MIN_RISK_PCT', 1.6):
             self.assertEqual(EX.fit_size(1000, 30, 100.0, 97.0, 1.0, '0.01', 0.01)['gate'], 'below_min_risk')
 
 class TestSwapGuard(NoNetwork):

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-21 (sync 9)
+
+- **Exit slippage buffer raised** (`fees.slip_frac` 0.0018 → 0.0025, i.e. 0.25% of entry), as live. Applies to sizing, the hard cut, risk-cap open risk and the break-even scratch tolerance in `closes.is_scratch` (exit at/beyond `be_stop` minus 0.25%). `fees.entry_slip_frac` stays 0.0018.
+- Side effect: with the larger exit buffer in its denominator, `fee_heavy` (fees > 1/3 of the stop-out loss) effectively can no longer trigger; `cost_heavy` (fees-only share ≥ 12%) covers it.
+- Tests updated to the new default.
+
 ## 2026-10-21 (sync 7)
 
 - **1H ATR unreadable = skip:** a setup whose 1H ATR is missing, 0 or non-finite (or whose 1H candles can't be fetched) is rejected by `execute.py` with `atr unreadable` and never placed; `composite_score` treats it as unscorable (ranked last).

@@ -50,7 +50,7 @@ Needs Python 3.9+. No pip packages (PyYAML is used if installed).
 
 Defaults live in `config.example.yaml`. To change them, copy it to `config.yaml` in the repo root (or point `BOT_CONFIG` at a file) and edit. Bad values stop the scripts with a clear error.
 
-**How much is at risk.** Each trade risks at most `risk_per_trade_pct` (default 5%) of equity at the stop, fees, a 0.18% entry slippage and a 0.18% exit slippage buffer included; it is scaled down when leverage, margin, liquidation distance or the risk caps don't allow the full size. The risk caps (`risk.risk_caps`, `scripts/riskcap.py`) keep total open risk at the current stops ≤ 20% of equity and same-direction bot risk ≤ 15%, with at most 8 positions; if the open risk can't be computed, the old slot caps (4 open, 3 bot per side) apply. Gaps and slippage can make a loss bigger than planned. Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
+**How much is at risk.** Each trade risks at most `risk_per_trade_pct` (default 5%) of equity at the stop, fees, a 0.18% entry slippage and a 0.25% exit slippage buffer included; it is scaled down when leverage, margin, liquidation distance or the risk caps don't allow the full size. The risk caps (`risk.risk_caps`, `scripts/riskcap.py`) keep total open risk at the current stops ≤ 20% of equity and same-direction bot risk ≤ 15%, with at most 8 positions; if the open risk can't be computed, the old slot caps (4 open, 3 bot per side) apply. Gaps and slippage can make a loss bigger than planned. Lower risk_per_trade_pct (and hard_cut_pct proportionally) for less risk.
 
 ## Adapting it to your harness
 

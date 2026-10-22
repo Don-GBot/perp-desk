@@ -51,14 +51,17 @@ class TestFitSize(NoNetwork):
         self.assertIsNone(sz['gate']); self.assertFalse(sz['scaled_down']); self.assertEqual(sz['size'], EX.size_for(1000, 100.0, 97.0, 1.0, '0.01'))
         self.assertAlmostEqual(sz['risk_pct_actual'], 5.0, delta=0.01)
     def test_scaled_to_margin_cap(self):
-        # 0.5% stop: the full 5% size (~51 coins) needs ~5100 notional; 20x x 250 margin = 5000 max
-        sz = EX.fit_size(1000, 1000, 100.0, 99.5, 1.0, '0.01', 0.01)
+        # 0.4% stop: the full 5% size (~52.6 coins) needs ~5260 notional; 20x x 250 margin = 5000 max
+        sz = EX.fit_size(1000, 1000, 100.0, 99.6, 1.0, '0.01', 0.01)
         self.assertIsNone(sz['gate'], sz); self.assertTrue(sz['scaled_down']); self.assertIn('margin', sz['scaled_by'])
         self.assertLessEqual(sz['notional'] / sz['lev'], 250.0 + 1e-9); self.assertLess(sz['risk_pct_actual'], 5.0)
     def test_fee_heavy(self):
-        sz = EX.fit_size(1000, 1000, 100.0, 99.95, 1.0, '0.01', 0.01)   # 0.05% stop: fees > 1/3 of the loss, scaled -> skip
-        self.assertEqual(sz['gate'], 'fee_heavy', sz)
-        self.assertGreater(EX.fee_share(100.0, 99.95), EX.FEE_HEAVY_MAX); self.assertLess(EX.fee_share(100.0, 99.5), EX.FEE_HEAVY_MAX)
+        # with the 0.25% exit slip in the denominator the default 1/3 effectively can't trigger (0.05% stop: ~0.286)
+        self.assertLess(EX.fee_share(100.0, 99.95), EX.FEE_HEAVY_MAX)
+        with mock.patch.object(EX, 'FEE_HEAVY_MAX', 0.25):   # lowered threshold: the gate still works for a scaled trade
+            sz = EX.fit_size(1000, 1000, 100.0, 99.95, 1.0, '0.01', 0.01)
+            self.assertEqual(sz['gate'], 'fee_heavy', sz)
+            self.assertGreater(EX.fee_share(100.0, 99.95), EX.FEE_HEAVY_MAX); self.assertLess(EX.fee_share(100.0, 99.6), EX.FEE_HEAVY_MAX)
     def test_liq_bounds_leverage(self):
         self.assertEqual(EX.lev_liq_max(100.0, 90.0), 4)          # 10% stop: liq dist 100 x (1/L - 0.005) must be > 20
         self.assertIsNone(EX.lev_liq_max(100.0, 80.0))
@@ -69,13 +72,13 @@ class TestFitSize(NoNetwork):
         self.assertEqual(EX.fit_size(1000, 1000, 100.0, 97.0, 1.0, '1', 1, risk_cap=0.5)['gate'], 'cap_risk')
     def test_scale_down_off(self):
         with mock.patch.object(EX, 'SCALE_DOWN', False):
-            self.assertEqual(EX.fit_size(1000, 1000, 100.0, 99.5, 1.0, '0.01', 0.01)['gate'], 'no_leverage_fit')
+            self.assertEqual(EX.fit_size(1000, 1000, 100.0, 99.6, 1.0, '0.01', 0.01)['gate'], 'no_leverage_fit')
 
 def P(inst, q, avg, mark, ct=None):
     return dict(instId=inst, positions=str(q), averagePrice=str(avg), markPrice=str(mark), createTime=str(ct or T.now_ms()))
 
 class TestRiskCap(NoNetwork):
-    F, S = 0.0006, 0.0018
+    F, S = 0.0006, 0.0025
     def a(self, pos, rows, bot=lambda p: True, side='buy', rec=None):
         return RC.assess(side, pos, rows, lambda i: 1.0, 1000.0, bot, self.F, self.S, rec)
     def test_open_risk_formula_and_headroom(self):
@@ -198,7 +201,7 @@ class TestReviewFollowups(GateBase):
             self.assertGreater(EX.fee_share(100.0, 97.0), EX.FEE_HEAVY_MAX)
             sz = EX.fit_size(1000, 1000, 100.0, 97.0, 1.0, '0.01', 0.01)
             self.assertFalse(sz['scaled_down'], sz); self.assertIsNone(sz['gate'], sz)
-            self.assertEqual(EX.fit_size(1000, 1000, 100.0, 99.5, 1.0, '0.01', 0.01)['gate'], 'fee_heavy')   # scaled -> applies
+            self.assertEqual(EX.fit_size(1000, 1000, 100.0, 99.6, 1.0, '0.01', 0.01)['gate'], 'fee_heavy')   # scaled -> applies
     def test_gate_of_mapping(self):
         for why, g in (('cooldown: x', 'cooldown'), ('overall cap', 'overall_cap'), ('direction cap 3/3', 'dir_cap'),
                        ('unresolved_record (X)', 'unresolved_record'), ('pair already has a position', 'duplicate'),

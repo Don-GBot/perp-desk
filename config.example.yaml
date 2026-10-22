@@ -70,13 +70,13 @@ fees:
   # Taker fee per side as a fraction (0.0006 = 0.06%). Used in the R:R check and in sizing, so a
   # clean stop-out loses about risk_per_trade_pct of equity including entry and exit fees.
   taker_rate: 0.0006
-  # Slippage buffer as a fraction of entry (0.0018 = 0.18%), added to the loss at the stop in sizing and in
+  # Slippage buffer as a fraction of entry (0.0025 = 0.25%), added to the loss at the stop in sizing and in
   # the hard cut: loss per coin = |entry - stop| + taker_rate x (entry + stop) + slip_frac x entry.
   # A buffer, not a cap: a worse stop fill can still lose more, and the hard cut cannot catch slippage
   # inside the exchange's own stop fill. Measure your own fills and adjust.
-  slip_frac: 0.0018
+  slip_frac: 0.0025
   # Expected adverse MARKET-ENTRY fill vs the quote, fraction of entry. Added to the planned stop-out loss in
-  # sizing (not in the hard cut, which uses the real average price). Default = slip_frac as a conservative
+  # sizing (not in the hard cut, which uses the real average price). Default 0.18%, below the 0.25% exit buffer, as an
   # estimate until you have entry-fill data. The fee_heavy share deliberately keeps the old denominator (without this term).
   entry_slip_frac: 0.0018
 
